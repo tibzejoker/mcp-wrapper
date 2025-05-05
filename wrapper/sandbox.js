@@ -67,17 +67,70 @@ class Sandbox {
             if (!allowed) {
                 throw new Error('Accès réseau non autorisé dans la sandbox');
             }
-            return {
+            
+            // Simuler une réponse HTTP
+            const mockResponse = {
                 status: 200,
+                statusCode: 200,
                 headers: { 'content-type': 'application/json' },
-                json: () => Promise.resolve({ message: 'Réponse simulée' })
+                on: (event, callback) => {
+                    if (event === 'data') {
+                        callback(Buffer.from(JSON.stringify({ message: 'Réponse simulée' })));
+                    }
+                    if (event === 'end') {
+                        callback();
+                    }
+                },
+                json: () => Promise.resolve({ message: 'Réponse simulée' }),
+                text: () => Promise.resolve('Réponse simulée'),
+                body: { message: 'Réponse simulée' }
             };
+
+            return mockResponse;
         };
 
         // Proxy pour http et https
         const httpProxy = {
-            get: (url, options) => handleRequest(url, { method: 'GET', ...options }),
-            request: (url, options) => handleRequest(url, options),
+            get: (url, callback) => {
+                const req = {
+                    on: (event, handler) => {
+                        if (event === 'error') {
+                            // Ne rien faire, la requête est simulée
+                        }
+                    },
+                    end: () => {
+                        handleRequest(url)
+                            .then(response => callback(response))
+                            .catch(error => {
+                                const errorEvent = { on: (type, handler) => handler() };
+                                callback(errorEvent);
+                            });
+                    }
+                };
+                return req;
+            },
+            request: (url, options, callback) => {
+                if (typeof options === 'function') {
+                    callback = options;
+                    options = {};
+                }
+                const req = {
+                    on: (event, handler) => {
+                        if (event === 'error') {
+                            // Ne rien faire, la requête est simulée
+                        }
+                    },
+                    end: () => {
+                        handleRequest(url, options)
+                            .then(response => callback(response))
+                            .catch(error => {
+                                const errorEvent = { on: (type, handler) => handler() };
+                                callback(errorEvent);
+                            });
+                    }
+                };
+                return req;
+            },
             createServer: () => {
                 throw new Error('Création de serveur non autorisée dans la sandbox');
             }
@@ -177,6 +230,11 @@ class Sandbox {
     // Exécute un script Python
     runPythonScript(scriptPath) {
         return new Promise((resolve, reject) => {
+            // Créer le dossier de la sandbox s'il n'existe pas
+            if (!fs.existsSync(this.rootDir)) {
+                fs.mkdirSync(this.rootDir, { recursive: true });
+            }
+
             const sandboxedScriptPath = this.resolveSandboxPath('script.py');
             const content = fs.readFileSync(scriptPath, 'utf8');
             fs.writeFileSync(sandboxedScriptPath, content, 'utf8');
@@ -202,7 +260,23 @@ http.client.HTTPSConnection = block_network
 
 # Redéfinir la racine comme /
 ROOT_DIR = '${this.rootDir.replace(/\\/g, '\\\\')}'
-os.chdir(ROOT_DIR)
+
+# Surcharger os.environ pour masquer les chemins
+original_environ = dict(os.environ)
+os.environ = {
+    k: v.replace(ROOT_DIR, '/').replace('\\\\', '/') if isinstance(v, str) else v
+    for k, v in original_environ.items()
+}
+
+# Surcharger os.getcwd
+os.getcwd = lambda: '/'
+
+# Surcharger os.path.abspath
+original_abspath = os.path.abspath
+os.path.abspath = lambda path: '/' + os.path.relpath(original_abspath(path), ROOT_DIR).replace('\\\\', '/')
+
+# Surcharger os.path pour utiliser des chemins POSIX
+os.path = posixpath
 
 def to_sandbox_path(real_path):
     if not real_path.startswith(ROOT_DIR):
@@ -213,26 +287,21 @@ def to_sandbox_path(real_path):
 def mask_error_message(error):
     if not hasattr(error, 'filename') or not error.filename:
         return error
+    if hasattr(error, 'message'):
+        error.message = error.message.replace(ROOT_DIR, '/').replace('\\\\', '/')
+    if hasattr(error, 'strerror'):
+        error.strerror = str(error.strerror).replace(ROOT_DIR, '/').replace('\\\\', '/')
     error.filename = to_sandbox_path(error.filename)
     return error
 
-# Fonction pour convertir les chemins en chemins sandbox
 def resolve_sandbox_path(path):
     if path.startswith('/'):
         return os.path.join(ROOT_DIR, path[1:])
     return os.path.join(ROOT_DIR, path)
 
-# Fonction pour vérifier si un chemin est autorisé
 def is_path_allowed(path):
     resolved = resolve_sandbox_path(path)
     return resolved.startswith(ROOT_DIR)
-
-# Surcharger os.path pour utiliser des chemins POSIX
-os.path = posixpath
-
-# Surcharger os.getcwd pour retourner /
-original_getcwd = os.getcwd
-os.getcwd = lambda: '/'
 
 # Surcharger les fonctions d'accès aux fichiers
 original_open = open
@@ -256,9 +325,21 @@ def sandboxed_makedirs(path, *args, **kwargs):
     except Exception as e:
         raise mask_error_message(e)
 
+# Surcharger os.remove
+original_remove = os.remove
+def sandboxed_remove(path, *args, **kwargs):
+    try:
+        sandbox_path = resolve_sandbox_path(path)
+        if not is_path_allowed(sandbox_path):
+            raise PermissionError(f"Accès refusé: {path} est en dehors de la racine")
+        return original_remove(sandbox_path, *args, **kwargs)
+    except Exception as e:
+        raise mask_error_message(e)
+
 # Appliquer les surcharges
 open = sandboxed_open
 os.makedirs = sandboxed_makedirs
+os.remove = sandboxed_remove
 
 # Exécuter le script utilisateur avec gestion des erreurs
 try:
@@ -325,7 +406,7 @@ except Exception as e:
     }
 
     // Exécute un script dans la sandbox
-    runScript(scriptPath) {
+    runScript(scriptPath, envVars = {}) {
         const ext = path.extname(scriptPath).toLowerCase();
         
         if (ext === '.py') {
