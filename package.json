@@ -1,0 +1,9 @@
+{
+  "name": "node-directory-display",
+  "version": "1.0.0",
+  "description": "A simple Node.js script that displays its current directory",
+  "main": "wrapper/test.js",
+  "scripts": {
+    "start": "node wrapper/test.js"
+  }
+} 
