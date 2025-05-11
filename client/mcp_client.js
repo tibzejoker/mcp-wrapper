@@ -13,6 +13,7 @@ class McpClient {
             input: process.stdin,
             output: process.stdout
         });
+        this.bridgeIdCallbacks = new Map();
     }
 
     connect() {
@@ -71,6 +72,14 @@ class McpClient {
 
             case 'command_sent':
                 console.log(`✅ Commande envoyée à la session ${message.sessionId}`);
+                break;
+
+            case 'bridge_id_generated':
+                const callback = this.bridgeIdCallbacks.get(message.requestId);
+                if (callback) {
+                    callback.resolve(message.bridgeId);
+                    this.bridgeIdCallbacks.delete(message.requestId);
+                }
                 break;
 
             default:
@@ -167,6 +176,31 @@ class McpClient {
             } catch (error) {
                 console.error('❌ Erreur:', error.message);
             }
+        });
+    }
+
+    async generateBridgeId() {
+        return new Promise((resolve, reject) => {
+            if (!this.ws) {
+                reject(new Error('Not connected to bridge'));
+                return;
+            }
+
+            const requestId = Date.now().toString();
+            this.bridgeIdCallbacks.set(requestId, { resolve, reject });
+
+            this.ws.send(JSON.stringify({
+                type: 'generate_bridge_id',
+                requestId
+            }));
+
+            // Timeout after 5 seconds
+            setTimeout(() => {
+                if (this.bridgeIdCallbacks.has(requestId)) {
+                    this.bridgeIdCallbacks.delete(requestId);
+                    reject(new Error('Bridge ID generation timeout'));
+                }
+            }, 5000);
         });
     }
 }

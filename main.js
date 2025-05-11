@@ -6,6 +6,50 @@ import { spawn } from 'child_process';
 
 // Stockage des sessions actives
 const sessions = new Map();
+const activeBridgeIds = new Map(); // Changed to Map to store timeout info
+const connectedBridges = new Map(); // Track connected bridges and their info
+
+// Fonction pour générer un ID de bridge unique
+function generateBridgeId() {
+    let bridgeId;
+    do {
+        // Generate a random 8-character hex string
+        bridgeId = Math.random().toString(16).substring(2, 10);
+    } while (activeBridgeIds.has(bridgeId));
+
+    const expiresAt = Date.now() + 60000; // 1 minute from now
+
+    // Set a 1-minute timeout for the bridge ID
+    const timeout = setTimeout(() => {
+        console.log(`\n⌛ Bridge ID ${bridgeId} expired`);
+        activeBridgeIds.delete(bridgeId);
+    }, 60000); // 1 minute timeout
+
+    // Store the bridge ID with its timeout and expiration time
+    activeBridgeIds.set(bridgeId, {
+        createdAt: Date.now(),
+        expiresAt: expiresAt,
+        timeout: timeout
+    });
+
+    return {
+        bridgeId,
+        expiresAt
+    };
+}
+
+// Function to validate bridge ID
+function validateBridgeId(bridgeId) {
+    const bridgeInfo = activeBridgeIds.get(bridgeId);
+    if (!bridgeInfo) {
+        return false;
+    }
+
+    // Clear the timeout as the bridge ID is being used
+    clearTimeout(bridgeInfo.timeout);
+    activeBridgeIds.delete(bridgeId);
+    return true;
+}
 
 // Fonction pour diffuser l'état des connexions à tous les clients
 function broadcastConnections() {
@@ -24,6 +68,34 @@ function broadcastConnections() {
     sessions.forEach(session => {
         if (session.ws && session.ws.readyState === 1) { // 1 = OPEN
             session.ws.send(message);
+        }
+    });
+}
+
+// Function to broadcast bridge status to all clients
+function broadcastBridgeStatus() {
+    const bridgeStatus = Array.from(connectedBridges.entries()).map(([bridgeId, info]) => ({
+        bridgeId,
+        platform: info.platform,
+        connectedAt: info.connectedAt,
+        status: 'connected'
+    }));
+
+    const message = JSON.stringify({
+        type: 'bridge_status_update',
+        bridges: bridgeStatus
+    });
+
+    // Also notify clients about bridge IDs that are no longer expiring
+    const bridgeValidationMessage = JSON.stringify({
+        type: 'bridge_validation_update',
+        validBridgeIds: Array.from(connectedBridges.keys())
+    });
+
+    sessions.forEach(session => {
+        if (session.ws && session.ws.readyState === 1) {
+            session.ws.send(message);
+            session.ws.send(bridgeValidationMessage);
         }
     });
 }
@@ -212,6 +284,57 @@ wss.on('connection', (ws) => {
             console.log(`\n📨 Message reçu pour la session ${sessionId}:`, JSON.stringify(data, null, 2));
 
             switch (data.type) {
+                case 'generate_bridge_id': {
+                    const { bridgeId, expiresAt } = generateBridgeId();
+                    console.log(`\n🔑 Generated bridge ID: ${bridgeId}, expires at: ${new Date(expiresAt).toISOString()}`);
+                    ws.send(JSON.stringify({
+                        type: 'bridge_id_generated',
+                        bridgeId,
+                        requestId: data.requestId,
+                        expiresAt
+                    }));
+                    break;
+                }
+
+                case 'bridge_register': {
+                    if (!data.bridgeId || !validateBridgeId(data.bridgeId)) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'Invalid or expired bridge ID'
+                        }));
+                        // Close the connection for invalid bridge IDs
+                        ws.close();
+                        return;
+                    }
+                    
+                    // Store bridge connection info
+                    connectedBridges.set(data.bridgeId, {
+                        platform: data.platform || 'unknown',
+                        connectedAt: Date.now(),
+                        ws: ws
+                    });
+
+                    console.log(`\n🔗 Bridge registered with ID: ${data.bridgeId}, Platform: ${data.platform || 'unknown'}`);
+                    ws.send(JSON.stringify({
+                        type: 'bridge_registered',
+                        bridgeId: data.bridgeId
+                    }));
+
+                    // Broadcast updated bridge status to all clients
+                    broadcastBridgeStatus();
+                    break;
+                }
+
+                case 'register_handler': {
+                    // Handle registration of message handlers
+                    console.log(`\n📝 Registering handler for session ${sessionId}`);
+                    ws.send(JSON.stringify({
+                        type: 'handler_registered',
+                        success: true
+                    }));
+                    break;
+                }
+
                 case 'start':
                     // Démarrer une nouvelle sandbox
                     if (!data.config || !data.config.scriptPath) {
@@ -462,6 +585,21 @@ wss.on('connection', (ws) => {
                     }
                     break;
 
+                case 'get_bridge_status': {
+                    const bridgeStatus = Array.from(connectedBridges.entries()).map(([bridgeId, info]) => ({
+                        bridgeId,
+                        platform: info.platform,
+                        connectedAt: info.connectedAt,
+                        status: 'connected'
+                    }));
+
+                    ws.send(JSON.stringify({
+                        type: 'bridge_status_update',
+                        bridges: bridgeStatus
+                    }));
+                    break;
+                }
+
                 default:
                     console.log(`\n⚠️ Type de message non reconnu pour la session ${sessionId}:`, data.type);
                     throw new Error('Type de message non reconnu');
@@ -475,9 +613,20 @@ wss.on('connection', (ws) => {
         }
     });
 
-    // Gestion de la déconnexion
+    // Handle bridge disconnection
     ws.on('close', () => {
         console.log(`\n🔌 Déconnexion WebSocket (session ${sessionId})`);
+        
+        // Check if this was a bridge connection
+        for (const [bridgeId, info] of connectedBridges.entries()) {
+            if (info.ws === ws) {
+                console.log(`\n🔌 Bridge ${bridgeId} disconnected`);
+                connectedBridges.delete(bridgeId);
+                broadcastBridgeStatus();
+                break;
+            }
+        }
+        
         stopSandbox(sessionId);
     });
 });

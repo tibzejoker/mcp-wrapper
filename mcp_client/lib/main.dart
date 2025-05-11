@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'dart:convert';
+import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/websocket_service.dart';
 import 'services/script_service.dart';
@@ -42,6 +44,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
   final _serverUrlController = TextEditingController(text: 'ws://localhost:3000');
   final _commandController = TextEditingController();
   final _outputController = TextEditingController();
+  final List<Map<String, dynamic>> _generatedBridgeIds = [];
+  Timer? _updateTimer;
   
   late WebSocketService _wsService;
   late ScriptService _scriptService;
@@ -67,6 +71,15 @@ class _MCPClientPageState extends State<MCPClientPage> {
     _scriptService = ScriptService(widget.prefs);
     _loadSavedScripts();
     _loadSavedEnvironments();
+    
+    // Start the update timer
+    _updateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_generatedBridgeIds.isNotEmpty) {
+        setState(() {
+          // This will trigger a rebuild of the list
+        });
+      }
+    });
   }
 
   Future<void> _loadSavedScripts() async {
@@ -88,6 +101,23 @@ class _MCPClientPageState extends State<MCPClientPage> {
       final data = jsonDecode(message);
       final type = data['type'];
       final connectionId = data['connectionId'];
+
+      switch (type) {
+        case 'bridge_id_generated':
+          print('Bridge ID generated: ${data['bridgeId']}');
+          setState(() {
+            _generatedBridgeIds.add({
+              'id': data['bridgeId'],
+              'generatedAt': DateTime.now().millisecondsSinceEpoch,
+              'expiresAt': data['expiresAt'],
+            });
+          });
+          break;
+
+        case 'bridge_registered':
+          print('Bridge registered: ${data['bridgeId']}');
+          break;
+      }
 
       if (connectionId != null) {
         final connection = _wsService.getConnection(connectionId);
@@ -308,6 +338,39 @@ class _MCPClientPageState extends State<MCPClientPage> {
     });
   }
 
+  Future<void> _generateBridgeId() async {
+    if (_currentConnectionId != null) {
+      final connection = _wsService.getConnection(_currentConnectionId!);
+      if (connection != null) {
+        try {
+          final result = await connection.generateBridgeId();
+          final bridgeId = result['bridgeId'];
+          final expiresAt = result['expiresAt'];
+          
+          setState(() {
+            _generatedBridgeIds.add({
+              'id': bridgeId,
+              'generatedAt': DateTime.now().millisecondsSinceEpoch,
+              'expiresAt': expiresAt,
+            });
+          });
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Bridge ID generated: $bridgeId')),
+          );
+        } catch (e) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to generate bridge ID: $e')),
+          );
+        }
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Not connected to server')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -342,23 +405,26 @@ class _MCPClientPageState extends State<MCPClientPage> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               // Server connection
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _serverUrlController,
-                      decoration: const InputDecoration(
-                        labelText: 'Server URL',
-                        border: OutlineInputBorder(),
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _serverUrlController,
+                        decoration: const InputDecoration(
+                          labelText: 'Server URL',
+                          border: OutlineInputBorder(),
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 16),
-                  ElevatedButton(
-                    onPressed: _connect,
-                    child: const Text('Connect'),
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: _isConnected ? _disconnect : _connect,
+                      child: Text(_isConnected ? 'Disconnect' : 'Connect'),
+                    ),
+                  ],
+                ),
               ),
               const SizedBox(height: 16),
 
@@ -409,6 +475,141 @@ class _MCPClientPageState extends State<MCPClientPage> {
                         ),
                       ],
                     ),
+                  ],
+                ),
+              ),
+
+              // Bridge ID controls
+              if (_isConnected) Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    ElevatedButton(
+                      onPressed: _generateBridgeId,
+                      child: const Text('Generate Bridge ID'),
+                    ),
+                    if (_generatedBridgeIds.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      const Text('Generated Bridge IDs:'),
+                      Container(
+                        height: 100,
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.grey),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: ListView.builder(
+                          itemCount: _generatedBridgeIds.length,
+                          itemBuilder: (context, index) {
+                            final bridgeId = _generatedBridgeIds[index];
+                            final id = bridgeId['id'];
+                            final expiresAt = DateTime.fromMillisecondsSinceEpoch(bridgeId['expiresAt']);
+                            final now = DateTime.now();
+                            
+                            // Check if this bridge is connected
+                            final connection = _wsService.getConnection(_currentConnectionId!);
+                            final connectedBridge = connection?.connectedBridges
+                              .firstWhere(
+                                (b) => b['bridgeId'] == id,
+                                orElse: () => <String, dynamic>{},
+                              );
+                            final isConnected = connectedBridge?.isNotEmpty ?? false;
+                            
+                            // Check if this bridge ID is valid (no expiration)
+                            final isValidated = connection?.validBridgeIds.contains(id) ?? false;
+                            
+                            // Only check expiration if not validated
+                            final isExpired = !isValidated && now.isAfter(expiresAt);
+                            
+                            return ListTile(
+                              leading: Icon(
+                                isConnected ? Icons.link : Icons.link_off,
+                                color: isConnected ? Colors.green : Colors.grey,
+                                size: 20,
+                              ),
+                              title: Text('ID: $id'),
+                              subtitle: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  if (isValidated)
+                                    const Text(
+                                      'Active - No Expiration',
+                                      style: TextStyle(
+                                        color: Colors.green,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    )
+                                  else
+                                    Text(
+                                      isExpired 
+                                        ? 'Expired'
+                                        : 'Expires at ${expiresAt.hour.toString().padLeft(2, '0')}:${expiresAt.minute.toString().padLeft(2, '0')}:${expiresAt.second.toString().padLeft(2, '0')}'
+                                    ),
+                                  if (!isExpired && !isValidated)
+                                    Text(
+                                      'Remaining: ${_formatDuration(expiresAt.difference(now))}',
+                                      style: TextStyle(
+                                        color: Colors.grey[600],
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  if (isConnected) ...[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Platform: ${connectedBridge!['platform']}',
+                                      style: const TextStyle(
+                                        color: Colors.green,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    Text(
+                                      'Connected since: ${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).hour.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).minute.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).second.toString().padLeft(2, '0')}',
+                                      style: TextStyle(
+                                        color: Colors.grey[600],
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              tileColor: isExpired ? Colors.grey[200] : null,
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (!isExpired || isValidated)
+                                    IconButton(
+                                      icon: const Icon(Icons.copy),
+                                      onPressed: () {
+                                        Clipboard.setData(ClipboardData(text: id)).then((_) {
+                                          ScaffoldMessenger.of(context).showSnackBar(
+                                            const SnackBar(
+                                              content: Text('Bridge ID copied to clipboard'),
+                                              duration: Duration(seconds: 2),
+                                            ),
+                                          );
+                                        });
+                                      },
+                                      tooltip: 'Copy Bridge ID',
+                                      iconSize: 20,
+                                    ),
+                                  IconButton(
+                                    icon: const Icon(Icons.delete),
+                                    onPressed: () {
+                                      setState(() {
+                                        _generatedBridgeIds.removeAt(index);
+                                      });
+                                    },
+                                    tooltip: 'Delete Bridge ID',
+                                    iconSize: 20,
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -719,6 +920,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
 
   @override
   void dispose() {
+    _updateTimer?.cancel();
     _serverUrlController.dispose();
     _commandController.dispose();
     _outputController.dispose();
@@ -803,6 +1005,19 @@ class _MCPClientPageState extends State<MCPClientPage> {
         TextPosition(offset: _outputController.text.length),
       );
     });
+  }
+
+  String _formatDuration(Duration duration) {
+    if (duration.isNegative) return 'Expired';
+    
+    final minutes = duration.inMinutes;
+    final seconds = duration.inSeconds % 60;
+    
+    if (minutes > 0) {
+      return '${minutes}m ${seconds}s';
+    } else {
+      return '${seconds}s';
+    }
   }
 }
 

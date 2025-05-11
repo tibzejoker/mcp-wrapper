@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:async';
 
 class Sandbox {
   final String id;
@@ -32,6 +33,8 @@ class WebSocketConnection {
   WebSocketChannel? channel;
   bool isConnected;
   final List<Sandbox> sandboxes;
+  final List<Map<String, dynamic>> connectedBridges = [];
+  final Set<String> validBridgeIds = {};
   final Function(String) onMessage;
   final Function(String) onError;
   final Function(String) onStdout;
@@ -53,6 +56,34 @@ class WebSocketConnection {
           print('Message reçu: $message');
           final data = jsonDecode(message);
           switch(data['type']) {
+            case 'bridge_validation_update':
+              print('Bridge validation update received');
+              final validIds = List<String>.from(data['validBridgeIds']);
+              validBridgeIds
+                ..clear()
+                ..addAll(validIds);
+              onMessage(message);
+              break;
+
+            case 'bridge_status_update':
+              print('Bridge status update received');
+              final bridges = List<Map<String, dynamic>>.from(data['bridges']);
+              connectedBridges
+                ..clear()
+                ..addAll(bridges);
+              onMessage(message);
+              break;
+
+            case 'bridge_id_generated':
+              print('Bridge ID generated response received');
+              onMessage(message);
+              break;
+
+            case 'bridge_registered':
+              print('Bridge registration confirmed');
+              onMessage(message);
+              break;
+
             case 'sandbox_status':
               final sandboxId = data['sandboxId'];
               final status = data['status'];
@@ -115,6 +146,11 @@ class WebSocketConnection {
         },
       );
       isConnected = true;
+
+      // Request initial bridge status
+      channel!.sink.add(jsonEncode({
+        'type': 'get_bridge_status',
+      }));
     } catch (e) {
       print('Erreur de connexion: $e');
       isConnected = false;
@@ -210,6 +246,45 @@ class WebSocketConnection {
     };
 
     channel!.sink.add(jsonEncode(message));
+  }
+
+  Future<Map<String, dynamic>> generateBridgeId() async {
+    if (!isConnected) {
+      throw Exception('Not connected to server');
+    }
+
+    final completer = Completer<Map<String, dynamic>>();
+    final requestId = DateTime.now().millisecondsSinceEpoch.toString();
+
+    // Add a one-time message handler for the bridge ID response
+    void messageHandler(dynamic message) {
+      try {
+        final data = jsonDecode(message);
+        if (data['type'] == 'bridge_id_generated' && data['requestId'] == requestId) {
+          completer.complete({
+            'bridgeId': data['bridgeId'],
+            'expiresAt': data['expiresAt'],
+          });
+        }
+      } catch (e) {
+        completer.completeError('Failed to parse bridge ID response: $e');
+      }
+    }
+
+    // Send the request
+    channel!.sink.add(jsonEncode({
+      'type': 'generate_bridge_id',
+      'requestId': requestId,
+    }));
+
+    // Set a timeout
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!completer.isCompleted) {
+        completer.completeError('Bridge ID generation timeout');
+      }
+    });
+
+    return completer.future;
   }
 }
 
