@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "description": "A simple Node.js script that displays its current directory",
   "main": "main.js",
+  "type": "module",
   "scripts": {
     "start": "node main.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.2"
   }
-} 
+}

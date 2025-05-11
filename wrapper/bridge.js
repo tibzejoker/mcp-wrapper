@@ -1,4 +1,4 @@
-class Bridge {
+export class Bridge {
     constructor() {
         // Handlers pour les différents événements
         this.handlers = {
@@ -139,6 +139,4 @@ class Bridge {
     log(message, type = 'stdout') {
         this.emit(type, { message });
     }
-}
-
-module.exports = Bridge; 
+} 

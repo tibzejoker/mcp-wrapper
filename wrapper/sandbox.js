@@ -1,7 +1,8 @@
-const fs = require('fs');
-const path = require('path');
-const { spawn } = require('child_process');
-const Bridge = require('./bridge');
+import fs from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
+import { Bridge } from './bridge.js';
+import vm from 'vm';
 
 class Sandbox {
     constructor(rootDir, envVars = {}) {
@@ -187,16 +188,7 @@ class Sandbox {
         const env = {
             fs: this.createFsProxy(),
             require: (id) => {
-                if (id === 'fs') return this.createFsProxy();
-                if (id === 'http' || id === 'https') return networkProxy[id];
-                if (id === 'path') {
-                    return {
-                        ...path,
-                        resolve: (...parts) => '/' + path.relative(this.rootDir, this.resolveSandboxPath(path.join(...parts))),
-                        join: (...parts) => '/' + path.relative(this.rootDir, this.resolveSandboxPath(path.join(...parts)))
-                    };
-                }
-                return require(id);
+                throw new Error('require() n\'est pas supporté en mode ES module dans la sandbox.');
             },
             console: this.createConsoleProxy(),
             __dirname: '/',
@@ -229,7 +221,7 @@ class Sandbox {
 
     // Exécute un script Python
     runPythonScript(scriptPath) {
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             // Créer le dossier de la sandbox s'il n'existe pas
             if (!fs.existsSync(this.rootDir)) {
                 fs.mkdirSync(this.rootDir, { recursive: true });
@@ -385,24 +377,193 @@ except Exception as e:
                 } catch (err) {
                     console.warn('Impossible de supprimer les fichiers temporaires:', err);
                 }
+            });
 
-                if (code === 0) {
-                    resolve();
-                } else {
-                    reject(new Error(`Script Python terminé avec le code ${code}`));
+            // Retourner immédiatement le contrôleur de processus
+            resolve({
+                process: pythonProcess,
+                stop: () => {
+                    pythonProcess.kill();
+                    try {
+                        fs.unlinkSync(wrapperPath);
+                        fs.unlinkSync(sandboxedScriptPath);
+                    } catch (err) {
+                        console.warn('Impossible de supprimer les fichiers temporaires:', err);
+                    }
                 }
             });
         });
     }
 
     // Exécute un script Node.js
-    runNodeScript(scriptPath) {
-        const vm = require('vm');
-        // Copier le script dans la sandbox
+    async runNodeScript(scriptPath) {
+        console.log('Exécution du script Node.js :', scriptPath);
         const content = fs.readFileSync(scriptPath, 'utf8');
-        const context = vm.createContext(this.prepareEnvironment());
-        const script = new vm.Script(content, { filename: '/script.js' });
-        script.runInContext(context);
+        
+        // Détection du type de module
+        const isESModule = /(^|\n)\s*import\s|export\s/m.test(content);
+        const nodeArgs = [];
+
+        // Configuration spécifique selon le type de module
+        if (isESModule) {
+            // Pour les modules ES, on crée un wrapper temporaire
+            const wrapperContent = `
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { createRequire } from 'module';
+import { spawn } from 'child_process';
+
+// Setup global require for ES modules
+global.require = createRequire(import.meta.url);
+
+// Setup __filename and __dirname for ES modules
+global.__filename = fileURLToPath(import.meta.url);
+global.__dirname = dirname(global.__filename);
+
+// Convert the path to a proper file URL
+const scriptUrl = new URL('file://' + '${scriptPath.replace(/\\/g, '/')}');
+
+// Function to kill a process and its children on Windows
+async function killProcessWindows(pid) {
+    return new Promise((resolve, reject) => {
+        const taskkill = spawn('taskkill', ['/pid', pid, '/T', '/F']);
+        taskkill.on('close', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(\`taskkill exited with code \${code}\`));
+            }
+        });
+    });
+}
+
+// Handle process termination
+process.on('SIGTERM', async () => {
+    try {
+        if (process.platform === 'win32') {
+            await killProcessWindows(process.pid);
+        } else {
+            process.exit(0);
+        }
+    } catch (err) {
+        console.error('Error during process termination:', err);
+        process.exit(1);
+    }
+});
+
+// Import and run the actual script
+import(scriptUrl)
+    .catch(error => {
+        console.error('Error importing script:', error);
+        process.exit(1);
+    });
+`;
+            const wrapperPath = path.join(path.dirname(scriptPath), '_es_wrapper.mjs');
+            fs.writeFileSync(wrapperPath, wrapperContent, 'utf8');
+            nodeArgs.push('--experimental-vm-modules');
+            nodeArgs.push(wrapperPath);
+        } else {
+            nodeArgs.push(scriptPath);
+        }
+
+        return new Promise((resolve) => {
+            const child = spawn(process.execPath, nodeArgs, {
+                cwd: path.dirname(scriptPath),
+                env: { 
+                    ...process.env, 
+                    ...this.envVars,
+                    NODE_NO_WARNINGS: '1'
+                },
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            // Configuration des streams
+            child.stdin.setEncoding('utf-8');
+            child.stdout.setEncoding('utf-8');
+            child.stderr.setEncoding('utf-8');
+
+            // Écouter les sorties du processus
+            child.stdout.on('data', (data) => {
+                try {
+                    // Essayer de parser la réponse JSON
+                    const response = JSON.parse(data.toString());
+                    console.log('[DEBUG] Réponse JSON reçue:', response);
+                    if (this.bridge) {
+                        this.bridge.emit('stdout', { message: data.toString(), isJson: true });
+                    }
+                } catch (e) {
+                    // Si ce n'est pas du JSON, envoyer comme texte brut
+                    console.log('[DEBUG] Sortie standard:', data.toString());
+                    if (this.bridge) {
+                        this.bridge.emit('stdout', { message: data.toString(), isJson: false });
+                    }
+                }
+            });
+
+            child.stderr.on('data', (data) => {
+                console.log('[DEBUG] Erreur standard:', data.toString());
+                if (this.bridge) {
+                    this.bridge.handleStderr({ message: data.toString() });
+                }
+            });
+
+            // Nettoyage du wrapper si nécessaire
+            if (isESModule) {
+                child.on('exit', () => {
+                    const wrapperPath = path.join(path.dirname(scriptPath), '_es_wrapper.mjs');
+                    try {
+                        if (fs.existsSync(wrapperPath)) {
+                            fs.unlinkSync(wrapperPath);
+                            console.log(`Wrapper supprimé: ${wrapperPath}`);
+                        } else {
+                            console.log(`Le wrapper n'existe plus ou a déjà été supprimé: ${wrapperPath}`);
+                        }
+                    } catch (err) {
+                        console.log(`Note: Impossible de supprimer le wrapper (${wrapperPath}), il a peut-être déjà été nettoyé`);
+                    }
+                });
+            }
+
+            // Retourner immédiatement le contrôleur de processus avec le processus complet
+            const processController = {
+                process: child,
+                stdin: child.stdin,
+                stdout: child.stdout,
+                stderr: child.stderr,
+                stop: async () => {
+                    try {
+                        if (process.platform === 'win32') {
+                            const taskkill = spawn('taskkill', ['/pid', child.pid, '/T', '/F']);
+                            await new Promise((resolve, reject) => {
+                                taskkill.on('close', (code) => {
+                                    if (code === 0) {
+                                        resolve();
+                                    } else {
+                                        reject(new Error(`taskkill exited with code ${code}`));
+                                    }
+                                });
+                            });
+                        } else {
+                            child.kill('SIGTERM');
+                        }
+                    } catch (err) {
+                        console.error('Erreur lors de l\'arrêt du processus:', err);
+                        child.kill('SIGKILL');
+                    }
+                }
+            };
+
+            console.log('\n[DEBUG] Création du processus:');
+            console.log('- child.stdin existe:', !!child.stdin);
+            console.log('- processController.stdin existe:', !!processController.stdin);
+            console.log('- Structure du processController:', JSON.stringify({
+                hasProcess: !!processController.process,
+                hasStdin: !!processController.stdin,
+                stdinType: typeof processController.stdin
+            }, null, 2));
+
+            resolve(processController);
+        });
     }
 
     // Exécute un script dans la sandbox
@@ -417,4 +578,4 @@ except Exception as e:
     }
 }
 
-module.exports = { Sandbox }; 
+export { Sandbox }; 
