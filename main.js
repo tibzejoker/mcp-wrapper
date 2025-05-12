@@ -267,13 +267,11 @@ const wss = new WebSocketServer({ server });
 // Gestion des connexions WebSocket
 wss.on('connection', (ws) => {
     const sessionId = Date.now().toString();
-    console.log(`\n🔌 Nouvelle connexion WebSocket (session ${sessionId})`);
-
-    // Stocker la session
+    console.log(`\n🔌 New client connected with session ID: ${sessionId}`);
+    
     sessions.set(sessionId, { 
-        ws, 
-        sandboxes: new Map(), // Map des sandboxes actives
-        startTime: new Date(),
+        ws,
+        sandboxes: new Map()
     });
 
     // Envoyer l'état initial des connexions
@@ -282,19 +280,8 @@ wss.on('connection', (ws) => {
     // Gestion des messages
     ws.on('message', async (data) => {
         try {
-            console.log('\n[DEBUG] Message WebSocket reçu:', data.toString());
             const message = JSON.parse(data);
-            console.log('[DEBUG] Message parsé:', JSON.stringify(message, null, 2));
-
-            if (message.type === 'command') {
-                console.log('[DEBUG] Commande reçue:', message.command);
-                try {
-                    const commandData = JSON.parse(message.command);
-                    console.log('[DEBUG] Commande parsée:', JSON.stringify(commandData, null, 2));
-                } catch (e) {
-                    console.log('[DEBUG] Erreur parsing commande:', e.message);
-                }
-            }
+            console.log(`\n📨 Message received from session ${sessionId}:`, message);
 
             switch (message.type) {
                 case 'generate_bridge_id': {
