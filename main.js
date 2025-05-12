@@ -4,6 +4,8 @@ import { WebSocketServer } from 'ws';
 import http from 'http';
 import { spawn } from 'child_process';
 
+console.log('🚀 Serveur démarré avec nodemon - Test de rechargement automatique!');
+
 // Stockage des sessions actives
 const sessions = new Map();
 const activeBridgeIds = new Map(); // Changed to Map to store timeout info
@@ -278,26 +280,37 @@ wss.on('connection', (ws) => {
     broadcastConnections();
 
     // Gestion des messages
-    ws.on('message', async (message) => {
+    ws.on('message', async (data) => {
         try {
-            const data = JSON.parse(message);
-            console.log(`\n📨 Message reçu pour la session ${sessionId}:`, JSON.stringify(data, null, 2));
+            console.log('\n[DEBUG] Message WebSocket reçu:', data.toString());
+            const message = JSON.parse(data);
+            console.log('[DEBUG] Message parsé:', JSON.stringify(message, null, 2));
 
-            switch (data.type) {
+            if (message.type === 'command') {
+                console.log('[DEBUG] Commande reçue:', message.command);
+                try {
+                    const commandData = JSON.parse(message.command);
+                    console.log('[DEBUG] Commande parsée:', JSON.stringify(commandData, null, 2));
+                } catch (e) {
+                    console.log('[DEBUG] Erreur parsing commande:', e.message);
+                }
+            }
+
+            switch (message.type) {
                 case 'generate_bridge_id': {
                     const { bridgeId, expiresAt } = generateBridgeId();
                     console.log(`\n🔑 Generated bridge ID: ${bridgeId}, expires at: ${new Date(expiresAt).toISOString()}`);
                     ws.send(JSON.stringify({
                         type: 'bridge_id_generated',
                         bridgeId,
-                        requestId: data.requestId,
+                        requestId: message.requestId,
                         expiresAt
                     }));
                     break;
                 }
 
                 case 'bridge_register': {
-                    if (!data.bridgeId || !validateBridgeId(data.bridgeId)) {
+                    if (!message.bridgeId || !validateBridgeId(message.bridgeId)) {
                         ws.send(JSON.stringify({
                             type: 'error',
                             error: 'Invalid or expired bridge ID'
@@ -308,16 +321,16 @@ wss.on('connection', (ws) => {
                     }
                     
                     // Store bridge connection info
-                    connectedBridges.set(data.bridgeId, {
-                        platform: data.platform || 'unknown',
+                    connectedBridges.set(message.bridgeId, {
+                        platform: message.platform || 'unknown',
                         connectedAt: Date.now(),
                         ws: ws
                     });
 
-                    console.log(`\n🔗 Bridge registered with ID: ${data.bridgeId}, Platform: ${data.platform || 'unknown'}`);
+                    console.log(`\n🔗 Bridge registered with ID: ${message.bridgeId}, Platform: ${message.platform || 'unknown'}`);
                     ws.send(JSON.stringify({
                         type: 'bridge_registered',
-                        bridgeId: data.bridgeId
+                        bridgeId: message.bridgeId
                     }));
 
                     // Broadcast updated bridge status to all clients
@@ -337,15 +350,15 @@ wss.on('connection', (ws) => {
 
                 case 'start':
                     // Démarrer une nouvelle sandbox
-                    if (!data.config || !data.config.scriptPath) {
+                    if (!message.config || !message.config.scriptPath) {
                         throw new Error('Chemin du script requis');
                     }
 
                     console.log(`\n🚀 Démarrage de la sandbox pour la session ${sessionId}`);
-                    console.log(`📁 Chemin du script: ${data.config.scriptPath}`);
-                    console.log(`⚙️ Variables d'environnement:`, data.config.env || {});
+                    console.log(`📁 Chemin du script: ${message.config.scriptPath}`);
+                    console.log(`⚙️ Variables d'environnement:`, message.config.env || {});
 
-                    const sandbox = new Sandbox(data.config.scriptPath, data.config.env || {});
+                    const sandbox = new Sandbox(message.config.scriptPath, message.config.env || {});
                     const bridge = sandbox.getBridge();
 
                     // Configuration des handlers du bridge
@@ -355,7 +368,7 @@ wss.on('connection', (ws) => {
                             ws.send(JSON.stringify({
                                 type: 'stdout',
                                 connectionId: sessionId,
-                                sandboxId: data.sandboxId,
+                                sandboxId: message.sandboxId,
                                 message
                             }));
                             return true;
@@ -365,7 +378,7 @@ wss.on('connection', (ws) => {
                             ws.send(JSON.stringify({
                                 type: 'stderr',
                                 connectionId: sessionId,
-                                sandboxId: data.sandboxId,
+                                sandboxId: message.sandboxId,
                                 message
                             }));
                             return true;
@@ -375,7 +388,7 @@ wss.on('connection', (ws) => {
                             ws.send(JSON.stringify({
                                 type: 'error',
                                 connectionId: sessionId,
-                                sandboxId: data.sandboxId,
+                                sandboxId: message.sandboxId,
                                 source,
                                 error: error.message
                             }));
@@ -383,14 +396,14 @@ wss.on('connection', (ws) => {
 
                     // Démarrer le script
                     console.log(`\n▶️ Exécution du script pour la session ${sessionId}`);
-                    sandbox.runScript(data.config.scriptPath).then(process => {
+                    sandbox.runScript(message.config.scriptPath).then(process => {
                         console.log(`\n[DEBUG] Processus démarré. PID: ${process.pid}`);
                         
                         // Stocker la sandbox immédiatement
                         const session = sessions.get(sessionId);
                         console.log(`\n[DEBUG] === DÉBUT ENREGISTREMENT SANDBOX ===`);
                         console.log(`[DEBUG] Session ID: ${sessionId}`);
-                        console.log(`[DEBUG] Sandbox ID: ${data.sandboxId}`);
+                        console.log(`[DEBUG] Sandbox ID: ${message.sandboxId}`);
                         console.log(`[DEBUG] Session existe: ${!!session}`);
                         console.log(`[DEBUG] État actuel des sandboxes:`, Array.from(session.sandboxes.keys()));
                         
@@ -398,22 +411,22 @@ wss.on('connection', (ws) => {
                         const sandboxInfo = {
                             sandbox,
                             process,
-                            scriptPath: data.config.scriptPath,
-                            env: data.config.env || {},
+                            scriptPath: message.config.scriptPath,
+                            env: message.config.env || {},
                             isRunning: true
                         };
 
                         // Enregistrer la sandbox
-                        session.sandboxes.set(data.sandboxId, sandboxInfo);
+                        session.sandboxes.set(message.sandboxId, sandboxInfo);
                         
                         // Vérifier que la sandbox est bien enregistrée
                         console.log(`[DEBUG] Sandbox enregistrée. Nouvel état:`, Array.from(session.sandboxes.keys()));
-                        console.log(`[DEBUG] Vérification de l'enregistrement:`, session.sandboxes.has(data.sandboxId));
+                        console.log(`[DEBUG] Vérification de l'enregistrement:`, session.sandboxes.has(message.sandboxId));
                         console.log(`[DEBUG] Contenu de la sandbox:`, JSON.stringify(sandboxInfo, null, 2));
                         console.log(`[DEBUG] === FIN ENREGISTREMENT SANDBOX ===\n`);
 
                         // Vérification finale
-                        console.log(`[DEBUG] Vérification finale - Sandbox toujours présente:`, session.sandboxes.has(data.sandboxId));
+                        console.log(`[DEBUG] Vérification finale - Sandbox toujours présente:`, session.sandboxes.has(message.sandboxId));
                         console.log(`[DEBUG] État final des sandboxes:`, Array.from(session.sandboxes.keys()));
 
                         console.log(`\n✅ Script démarré pour la session ${sessionId}`);
@@ -421,9 +434,9 @@ wss.on('connection', (ws) => {
                             type: 'sandbox_updated',
                             connectionId: sessionId,
                             sandbox: {
-                                id: data.sandboxId,
-                                scriptPath: data.config.scriptPath,
-                                env: data.config.env,
+                                id: message.sandboxId,
+                                scriptPath: message.config.scriptPath,
+                                env: message.config.env,
                                 isRunning: true
                             }
                         }));
@@ -444,9 +457,9 @@ wss.on('connection', (ws) => {
                     const currentSession = sessions.get(sessionId);
                     console.log(`\n[DEBUG] État des sandboxes avant arrêt:`, Array.from(currentSession.sandboxes.keys()));
                     
-                    if (currentSession && currentSession.sandboxes.has(data.sandboxId)) {
-                        console.log(`\n[DEBUG] Sandbox ${data.sandboxId} trouvée, début de l'arrêt`);
-                        const sandboxInfo = currentSession.sandboxes.get(data.sandboxId);
+                    if (currentSession && currentSession.sandboxes.has(message.sandboxId)) {
+                        console.log(`\n[DEBUG] Sandbox ${message.sandboxId} trouvée, début de l'arrêt`);
+                        const sandboxInfo = currentSession.sandboxes.get(message.sandboxId);
                         if (sandboxInfo.process) {
                             try {
                                 // Importer execSync au début
@@ -487,19 +500,19 @@ wss.on('connection', (ws) => {
                                 console.error(`\n[DEBUG] Erreur lors de l'arrêt du processus:`, error);
                             }
                         }
-                        currentSession.sandboxes.delete(data.sandboxId);
+                        currentSession.sandboxes.delete(message.sandboxId);
                         console.log(`\n[DEBUG] Sandbox supprimée. État final:`, Array.from(currentSession.sandboxes.keys()));
                         
                         ws.send(JSON.stringify({
                             type: 'sandbox_updated',
                             connectionId: sessionId,
                             sandbox: {
-                                id: data.sandboxId,
+                                id: message.sandboxId,
                                 isRunning: false
                             }
                         }));
                     } else {
-                        console.log(`\n[DEBUG] Sandbox ${data.sandboxId} non trouvée pour la session ${sessionId}`);
+                        console.log(`\n[DEBUG] Sandbox ${message.sandboxId} non trouvée pour la session ${sessionId}`);
                         console.log(`[DEBUG] Sandboxes disponibles:`, Array.from(currentSession.sandboxes.keys()));
                     }
                     broadcastConnections();
@@ -508,63 +521,126 @@ wss.on('connection', (ws) => {
                 case 'command':
                     // Envoyer une commande au processus
                     const commandSession = sessions.get(sessionId);
-                    if (commandSession && commandSession.sandboxes.has(data.sandboxId)) {
-                        const sandboxInfo = commandSession.sandboxes.get(data.sandboxId);
-                        if (sandboxInfo.process && sandboxInfo.process.stdin) {
-                            console.log(`\n📝 Commande reçue pour la session ${sessionId}:`, data.command);
-                            
-                            // Formater la commande en JSON-RPC 2.0
-                            const jsonRpcRequest = {
-                                jsonrpc: "2.0",
-                                method: data.command,
-                                params: {},
-                                id: Date.now()
-                            };
+                    console.log(`\n[DEBUG] Traitement commande pour session ${sessionId}`);
+                    console.log(`[DEBUG] Session existe: ${!!commandSession}`);
+                    
+                    if (!commandSession) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'Session non trouvée',
+                            connectionId: sessionId
+                        }));
+                        break;
+                    }
 
-                            console.log('\n[DEBUG] Envoi de la commande JSON-RPC:', JSON.stringify(jsonRpcRequest, null, 2));
-                            sandboxInfo.process.stdin.write(JSON.stringify(jsonRpcRequest) + '\n');
-                            
-                            ws.send(JSON.stringify({
-                                type: 'command_sent',
-                                connectionId: sessionId,
-                                sandboxId: data.sandboxId
-                            }));
-                        } else {
-                            console.log('\n[DEBUG] État du processus:');
-                            console.log('- sandboxInfo.process existe:', !!sandboxInfo.process);
-                            if (sandboxInfo.process) {
-                                console.log('- Structure du processus:', JSON.stringify({
-                                    hasStdin: !!sandboxInfo.process.stdin,
-                                    processKeys: Object.keys(sandboxInfo.process)
-                                }, null, 2));
+                    console.log(`[DEBUG] Sandboxes disponibles:`, Array.from(commandSession.sandboxes.keys()));
+                    console.log(`[DEBUG] Recherche sandbox: ${message.sandboxId}`);
+                    
+                    if (!message.sandboxId) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'ID de sandbox manquant',
+                            connectionId: sessionId,
+                            availableSandboxes: Array.from(commandSession.sandboxes.keys())
+                        }));
+                        break;
+                    }
+
+                    if (!commandSession.sandboxes.has(message.sandboxId)) {
+                        console.log(`\n[DEBUG] Sandbox ${message.sandboxId} non trouvée. Sandboxes disponibles:`, 
+                            Array.from(commandSession.sandboxes.keys()));
+                        
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: `Sandbox ${message.sandboxId} non trouvée`,
+                            connectionId: sessionId,
+                            details: {
+                                requestedSandbox: message.sandboxId,
+                                availableSandboxes: Array.from(commandSession.sandboxes.keys()),
+                                suggestion: 'Veuillez vérifier que vous utilisez le bon ID de sandbox ou redémarrer la sandbox si nécessaire'
                             }
-                            throw new Error('Le processus n\'est pas prêt à recevoir des commandes');
+                        }));
+                        break;
+                    }
+
+                    const sandboxInfo = commandSession.sandboxes.get(message.sandboxId);
+                    if (!sandboxInfo.process || !sandboxInfo.process.stdin) {
+                        console.log('\n[DEBUG] État du processus:');
+                        console.log('- sandboxInfo.process existe:', !!sandboxInfo.process);
+                        if (sandboxInfo.process) {
+                            console.log('- Structure du processus:', JSON.stringify({
+                                hasStdin: !!sandboxInfo.process.stdin,
+                                processKeys: Object.keys(sandboxInfo.process)
+                            }, null, 2));
                         }
-                    } else {
-                        throw new Error('Sandbox non trouvée');
+                        
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'Le processus n\'est pas prêt à recevoir des commandes',
+                            connectionId: sessionId,
+                            sandboxId: message.sandboxId,
+                            details: {
+                                processState: sandboxInfo.process ? 'exists' : 'missing',
+                                stdinState: sandboxInfo.process?.stdin ? 'ready' : 'not_ready'
+                            }
+                        }));
+                        break;
+                    }
+
+                    console.log(`\n📝 Commande reçue pour la session ${sessionId}:`, message.command);
+                    
+                    try {
+                        // Parse the command string to get the JSON-RPC request
+                        const jsonRpcRequest = typeof message.command === 'string' 
+                            ? JSON.parse(message.command)
+                            : message.command;
+
+                        console.log('\n[DEBUG] Envoi de la commande JSON-RPC:', JSON.stringify(jsonRpcRequest, null, 2));
+                        
+                        // Send the parsed JSON-RPC request directly
+                        sandboxInfo.process.stdin.write(JSON.stringify(jsonRpcRequest) + '\n');
+                        
+                        ws.send(JSON.stringify({
+                            type: 'command_sent',
+                            connectionId: sessionId,
+                            sandboxId: message.sandboxId,
+                            command: jsonRpcRequest
+                        }));
+                    } catch (error) {
+                        console.error('\n[DEBUG] Erreur lors du parsing de la commande:', error);
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'Format de commande invalide',
+                            connectionId: sessionId,
+                            sandboxId: message.sandboxId,
+                            details: {
+                                originalError: error.message,
+                                command: message.command
+                            }
+                        }));
                     }
                     break;
 
                 case 'stdout':
                 case 'stderr':
-                    const sandboxId = data['sandboxId'];
-                    const message = data['message'];
-                    const isJson = data['isJson'] || false;
+                    const sandboxId = message['sandboxId'];
+                    const messageContent = message['message'];
+                    const isJson = message['isJson'] || false;
                     
                     // Transmettre le message au client
                     if (sessions.get(sessionId).ws && sessions.get(sessionId).ws.readyState === 1) {
                         sessions.get(sessionId).ws.send(JSON.stringify({
-                            type: data.type,
+                            type: message.type,
                             connectionId: sessionId,
                             sandboxId: sandboxId,
-                            message: message,
+                            message: messageContent,
                             isJson: isJson
                         }));
 
                         // Si c'est une réponse JSON, mettre à jour l'état de la sandbox
                         if (isJson) {
                             try {
-                                const jsonResponse = JSON.parse(message);
+                                const jsonResponse = JSON.parse(messageContent);
                                 const sandbox = sessions.get(sessionId).sandboxes.find(
                                     (s) => s.id === sandboxId
                                 );
@@ -601,11 +677,11 @@ wss.on('connection', (ws) => {
                 }
 
                 default:
-                    console.log(`\n⚠️ Type de message non reconnu pour la session ${sessionId}:`, data.type);
+                    console.log(`\n⚠️ Type de message non reconnu pour la session ${sessionId}:`, message.type);
                     throw new Error('Type de message non reconnu');
             }
         } catch (error) {
-            console.error(`\n❌ Erreur pour la session ${sessionId}:`, error);
+            console.error('❌ Erreur pour la session', sessionId + ':', error);
             ws.send(JSON.stringify({
                 type: 'error',
                 error: error.message

@@ -228,24 +228,30 @@ class WebSocketConnection {
     }
   }
 
-  void sendCommand(String sandboxId, String command) {
+  void sendCommand(String sandboxId, String command, String paramsJson) {
     if (!isConnected) {
       onError('Not connected to server');
       return;
     }
 
-    final sandbox = sandboxes.firstWhere(
-      (s) => s.id == sandboxId,
-      orElse: () => throw Exception('Sandbox not found'),
-    );
+    try {
+      final params = paramsJson.isNotEmpty ? jsonDecode(paramsJson) : {};
+      final message = {
+        'type': 'command',
+        'sandboxId': sandboxId,
+        'command': jsonEncode({
+          'jsonrpc': '2.0',
+          'method': command,
+          'params': params,
+          'id': DateTime.now().millisecondsSinceEpoch
+        })
+      };
 
-    final message = {
-      'type': 'command',
-      'sandboxId': sandboxId,
-      'command': command,
-    };
-
-    channel!.sink.add(jsonEncode(message));
+      print('Sending command message: ${jsonEncode(message)}');
+      channel!.sink.add(jsonEncode(message));
+    } catch (e) {
+      onError('Invalid JSON parameters: $e');
+    }
   }
 
   Future<Map<String, dynamic>> generateBridgeId() async {

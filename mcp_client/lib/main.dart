@@ -42,7 +42,8 @@ class MCPClientPage extends StatefulWidget {
 
 class _MCPClientPageState extends State<MCPClientPage> {
   final _serverUrlController = TextEditingController(text: 'ws://localhost:3000');
-  final _commandController = TextEditingController();
+  final _toolNameController = TextEditingController();
+  final _paramsController = TextEditingController();
   final _outputController = TextEditingController();
   final List<Map<String, dynamic>> _generatedBridgeIds = [];
   Timer? _updateTimer;
@@ -59,6 +60,13 @@ class _MCPClientPageState extends State<MCPClientPage> {
   bool _isConnected = false;
   String _sandboxFilter = 'running'; // 'all', 'running', 'stopped'
   String? _selectedSandboxId;
+
+  // Liste des méthodes disponibles
+  final List<String> _availableMethods = [
+    'tools/list',
+    'tools/call'
+  ];
+  String _selectedMethod = 'tools/list';  // Méthode par défaut
 
   @override
   void initState() {
@@ -277,11 +285,71 @@ class _MCPClientPageState extends State<MCPClientPage> {
     }
   }
 
-  void _sendCommand(String command) {
+  void _sendCommand() {
     if (_currentConnectionId != null && _selectedSandboxId != null) {
       final connection = _wsService.getConnection(_currentConnectionId!);
       if (connection != null) {
-        connection.sendCommand(_selectedSandboxId!, command);
+        try {
+          final method = _selectedMethod;
+          final toolName = _toolNameController.text.trim();
+          final paramsText = _paramsController.text.trim();
+          
+          // Prépare les paramètres selon la méthode
+          Map<String, dynamic> params;
+          if (method == 'tools/call') {
+            if (toolName.isEmpty) {
+              throw Exception('Tool name is required for tools/call');
+            }
+            
+            // Parse les arguments JSON si non vide
+            Map<String, dynamic> arguments;
+            try {
+              arguments = paramsText.isNotEmpty 
+                ? Map<String, dynamic>.from(jsonDecode(paramsText))
+                : {};
+            } catch (e) {
+              throw Exception('Invalid JSON arguments format: ${e.toString()}');
+            }
+            
+            // Format spécial pour tools/call
+            params = {
+              'name': toolName,
+              'arguments': arguments
+            };
+          } else {
+            // Pour les autres méthodes, parse les paramètres JSON
+            try {
+              params = paramsText.isNotEmpty 
+                ? Map<String, dynamic>.from(jsonDecode(paramsText))
+                : {};
+            } catch (e) {
+              throw Exception('Invalid JSON parameters format: ${e.toString()}');
+            }
+          }
+          
+          // Envoyer la commande
+          connection.sendCommand(_selectedSandboxId!, method, jsonEncode(params));
+          
+          // Clear params field but keep tool name for reuse
+          _paramsController.clear();
+          
+          setState(() {
+            final paramsStr = method == 'tools/call' 
+              ? 'name: $toolName, arguments: ${jsonEncode(params['arguments'])}'
+              : jsonEncode(params);
+            _outputController.text = '${_outputController.text}\nSending method: $method with params: $paramsStr';
+            _outputController.selection = TextSelection.fromPosition(
+              TextPosition(offset: _outputController.text.length),
+            );
+          });
+        } catch (e) {
+          setState(() {
+            _outputController.text = '${_outputController.text}\nError: ${e.toString()}';
+            _outputController.selection = TextSelection.fromPosition(
+              TextPosition(offset: _outputController.text.length),
+            );
+          });
+        }
       }
     }
   }
@@ -437,7 +505,70 @@ class _MCPClientPageState extends State<MCPClientPage> {
               const SizedBox(height: 16),
 
               // Command input
-              _buildCommandInput(),
+              Row(
+                children: [
+                  Expanded(
+                    flex: 2,
+                    child: DropdownButtonFormField<String>(
+                      value: _selectedMethod,
+                      decoration: const InputDecoration(
+                        labelText: 'Method',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: _availableMethods.map((method) {
+                        return DropdownMenuItem(
+                          value: method,
+                          child: Text(method),
+                        );
+                      }).toList(),
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() {
+                            _selectedMethod = value;
+                            // Clear params when changing method
+                            _paramsController.clear();
+                          });
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  if (_selectedMethod == 'tools/call') ...[
+                    Expanded(
+                      flex: 2,
+                      child: TextField(
+                        controller: _toolNameController,
+                        decoration: const InputDecoration(
+                          labelText: 'Tool Name',
+                          border: OutlineInputBorder(),
+                          hintText: 'execute_jql',
+                        ),
+                        enabled: _currentConnectionId != null && _selectedSandboxId != null,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  Expanded(
+                    flex: 3,
+                    child: TextField(
+                      controller: _paramsController,
+                      decoration: InputDecoration(
+                        labelText: _selectedMethod == 'tools/call' ? 'Tool Arguments (JSON)' : 'Parameters (JSON)',
+                        border: const OutlineInputBorder(),
+                        hintText: _selectedMethod == 'tools/call' 
+                          ? '{"jql": "project = GENIA"}'
+                          : '{}',
+                      ),
+                      enabled: _currentConnectionId != null && _selectedSandboxId != null,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _currentConnectionId != null && _selectedSandboxId != null ? () => _sendCommand() : null,
+                    child: const Text('Send'),
+                  ),
+                ],
+              ),
               const SizedBox(height: 16),
 
               // Output
@@ -922,52 +1053,13 @@ class _MCPClientPageState extends State<MCPClientPage> {
   void dispose() {
     _updateTimer?.cancel();
     _serverUrlController.dispose();
-    _commandController.dispose();
+    _toolNameController.dispose();
+    _paramsController.dispose();
     _outputController.dispose();
     if (_currentConnectionId != null) {
       _wsService.removeConnection(_currentConnectionId!);
     }
     super.dispose();
-  }
-
-  Widget _buildCommandInput() {
-    final bool canSendCommand = _currentConnectionId != null && 
-                              _selectedSandboxId != null && 
-                              _wsService.getConnection(_currentConnectionId!)
-                                ?.sandboxes.any((s) => s.id == _selectedSandboxId && s.isRunning) == true;
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(8.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (!canSendCommand)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 8.0),
-                child: Text(
-                  'Sélectionnez une sandbox en cours d\'exécution pour envoyer des commandes',
-                  style: TextStyle(color: Colors.orange),
-                ),
-              ),
-            TextField(
-              controller: _commandController,
-              decoration: const InputDecoration(
-                labelText: 'Command',
-                border: OutlineInputBorder(),
-              ),
-              onSubmitted: canSendCommand ? (_) => _sendCommand(_commandController.text) : null,
-              enabled: canSendCommand,
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: canSendCommand ? () => _sendCommand(_commandController.text) : null,
-              child: const Text('Send Command'),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 
   Future<void> _showSettingsDialog() async {
