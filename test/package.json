@@ -1,0 +1,7 @@
+{
+  "name": "mcp-wrapper-tests",
+  "version": "1.0.0",
+  "description": "Tests for MCP Wrapper",
+  "type": "module",
+  "private": true
+} 

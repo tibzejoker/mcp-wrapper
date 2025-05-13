@@ -14,7 +14,7 @@ void main() async {
 
 class MyApp extends StatelessWidget {
   final SharedPreferences prefs;
-  
+
   const MyApp({super.key, required this.prefs});
 
   @override
@@ -33,7 +33,7 @@ class MyApp extends StatelessWidget {
 
 class MCPClientPage extends StatefulWidget {
   final SharedPreferences prefs;
-  
+
   const MCPClientPage({super.key, required this.prefs});
 
   @override
@@ -41,13 +41,15 @@ class MCPClientPage extends StatefulWidget {
 }
 
 class _MCPClientPageState extends State<MCPClientPage> {
-  final _serverUrlController = TextEditingController(text: 'ws://localhost:3000');
+  final _serverUrlController =
+      TextEditingController(text: 'ws://localhost:3000');
   final _toolNameController = TextEditingController();
   final _paramsController = TextEditingController();
   final _outputController = TextEditingController();
+  final _outputScrollController = ScrollController();
   final List<Map<String, dynamic>> _generatedBridgeIds = [];
   Timer? _updateTimer;
-  
+
   late WebSocketService _wsService;
   late ScriptService _scriptService;
   List<String> _savedScripts = [];
@@ -62,11 +64,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
   String? _selectedSandboxId;
 
   // Liste des méthodes disponibles
-  final List<String> _availableMethods = [
-    'tools/list',
-    'tools/call'
-  ];
-  String _selectedMethod = 'tools/list';  // Méthode par défaut
+  final List<String> _availableMethods = ['tools/list', 'tools/call'];
+  String _selectedMethod = 'tools/list'; // Méthode par défaut
 
   @override
   void initState() {
@@ -79,7 +78,13 @@ class _MCPClientPageState extends State<MCPClientPage> {
     _scriptService = ScriptService(widget.prefs);
     _loadSavedScripts();
     _loadSavedEnvironments();
-    
+
+    // Setup auto-scrolling behavior for output
+    _outputScrollController.addListener(() {
+      // This will be called whenever the scroll position changes
+      // Could be used to track if user has manually scrolled up
+    });
+
     // Start the update timer
     _updateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_generatedBridgeIds.isNotEmpty) {
@@ -101,6 +106,44 @@ class _MCPClientPageState extends State<MCPClientPage> {
     final environments = await _scriptService.getSavedEnvironments();
     setState(() {
       _savedEnvironments = environments;
+    });
+  }
+
+  // Function to append text to the output with line limiting
+  void _appendToOutput(String newText) {
+    // Add the new text
+    String currentText = _outputController.text;
+    String updatedText =
+        currentText.isEmpty ? newText : '$currentText\n$newText';
+
+    // Count lines and limit to 200 if needed
+    List<String> lines = updatedText.split('\n');
+    if (lines.length > 200) {
+      // Keep only the last 200 lines
+      lines = lines.sublist(lines.length - 200);
+      updatedText = lines.join('\n');
+    }
+
+    // Update the controller
+    setState(() {
+      _outputController.text = updatedText;
+      _outputController.selection = TextSelection.fromPosition(
+        TextPosition(offset: _outputController.text.length),
+      );
+    });
+
+    // Force scroll to bottom after the frame is rendered
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        // Check that the controller is still attached to a scroll view
+        if (_outputScrollController.hasClients) {
+          // Jump to the end immediately
+          _outputScrollController
+              .jumpTo(_outputScrollController.position.maxScrollExtent);
+        }
+      } catch (e) {
+        print('Scroll error: $e');
+      }
     });
   }
 
@@ -163,8 +206,10 @@ class _MCPClientPageState extends State<MCPClientPage> {
                 if (_connectionInfo.containsKey(connectionId)) {
                   _connectionInfo[connectionId] = {
                     'url': connection.url,
-                    'status': connection.isConnected ? 'connected' : 'disconnected',
-                    'sandboxes': connection.sandboxes.map((s) => s.toJson()).toList(),
+                    'status':
+                        connection.isConnected ? 'connected' : 'disconnected',
+                    'sandboxes':
+                        connection.sandboxes.map((s) => s.toJson()).toList(),
                   };
                 }
               });
@@ -179,28 +224,22 @@ class _MCPClientPageState extends State<MCPClientPage> {
               final sandboxId = data['sandboxId'];
               final message = data['message'];
               final isJson = data['isJson'] ?? false;
-              
+
               String formattedMessage;
               if (isJson) {
                 try {
                   final jsonData = jsonDecode(message);
-                  formattedMessage = const JsonEncoder.withIndent('  ').convert(jsonData);
+                  formattedMessage =
+                      const JsonEncoder.withIndent('  ').convert(jsonData);
                 } catch (e) {
                   formattedMessage = message;
                 }
               } else {
                 formattedMessage = message;
               }
-              
+
               // Set the controller text and force a rebuild
-              _outputController.text = '${_outputController.text}\n${type.toUpperCase()}: $formattedMessage';
-              
-              // Force scroll to end and rebuild
-              setState(() {
-                _outputController.selection = TextSelection.fromPosition(
-                  TextPosition(offset: _outputController.text.length),
-                );
-              });
+              _appendToOutput(type.toUpperCase() + ': ' + formattedMessage);
               break;
             case 'sandbox_response_updated':
               final sandboxId = data['sandboxId'];
@@ -255,7 +294,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
       final connection = _wsService.getConnection(_currentConnectionId!);
       if (connection != null) {
         final Map<String, String> env = _selectedEnvironment != null
-            ? Map<String, String>.from(_savedEnvironments[_selectedEnvironment]!)
+            ? Map<String, String>.from(
+                _savedEnvironments[_selectedEnvironment]!)
             : <String, String>{};
         connection.startSandbox(_selectedScript!, env);
         setState(() {
@@ -293,61 +333,54 @@ class _MCPClientPageState extends State<MCPClientPage> {
           final method = _selectedMethod;
           final toolName = _toolNameController.text.trim();
           final paramsText = _paramsController.text.trim();
-          
+
           // Prépare les paramètres selon la méthode
           Map<String, dynamic> params;
           if (method == 'tools/call') {
             if (toolName.isEmpty) {
               throw Exception('Tool name is required for tools/call');
             }
-            
+
             // Parse les arguments JSON si non vide
             Map<String, dynamic> arguments;
             try {
-              arguments = paramsText.isNotEmpty 
-                ? Map<String, dynamic>.from(jsonDecode(paramsText))
-                : {};
+              arguments = paramsText.isNotEmpty
+                  ? Map<String, dynamic>.from(jsonDecode(paramsText))
+                  : {};
             } catch (e) {
               throw Exception('Invalid JSON arguments format: ${e.toString()}');
             }
-            
+
             // Format spécial pour tools/call
-            params = {
-              'name': toolName,
-              'arguments': arguments
-            };
+            params = {'name': toolName, 'arguments': arguments};
           } else {
             // Pour les autres méthodes, parse les paramètres JSON
             try {
-              params = paramsText.isNotEmpty 
-                ? Map<String, dynamic>.from(jsonDecode(paramsText))
-                : {};
+              params = paramsText.isNotEmpty
+                  ? Map<String, dynamic>.from(jsonDecode(paramsText))
+                  : {};
             } catch (e) {
-              throw Exception('Invalid JSON parameters format: ${e.toString()}');
+              throw Exception(
+                  'Invalid JSON parameters format: ${e.toString()}');
             }
           }
-          
+
           // Envoyer la commande
-          connection.sendCommand(_selectedSandboxId!, method, jsonEncode(params));
-          
+          connection.sendCommand(
+              _selectedSandboxId!, method, jsonEncode(params));
+
           // Clear params field but keep tool name for reuse
           _paramsController.clear();
-          
+
           setState(() {
-            final paramsStr = method == 'tools/call' 
-              ? 'name: $toolName, arguments: ${jsonEncode(params['arguments'])}'
-              : jsonEncode(params);
-            _outputController.text = '${_outputController.text}\nSending method: $method with params: $paramsStr';
-            _outputController.selection = TextSelection.fromPosition(
-              TextPosition(offset: _outputController.text.length),
-            );
+            final paramsStr = method == 'tools/call'
+                ? 'name: $toolName, arguments: ${jsonEncode(params['arguments'])}'
+                : jsonEncode(params);
+            _appendToOutput('Sending method: $method with params: $paramsStr');
           });
         } catch (e) {
           setState(() {
-            _outputController.text = '${_outputController.text}\nError: ${e.toString()}';
-            _outputController.selection = TextSelection.fromPosition(
-              TextPosition(offset: _outputController.text.length),
-            );
+            _appendToOutput('Error: ${e.toString()}');
           });
         }
       }
@@ -387,11 +420,10 @@ class _MCPClientPageState extends State<MCPClientPage> {
         );
         if (sandbox.lastResponse != null) {
           setState(() {
-            final formattedJson = const JsonEncoder.withIndent('  ').convert(sandbox.lastResponse);
-            _outputController.text = 'Last Response from Sandbox $sandboxId:\n$formattedJson';
-            _outputController.selection = TextSelection.fromPosition(
-              TextPosition(offset: _outputController.text.length),
-            );
+            final formattedJson = const JsonEncoder.withIndent('  ')
+                .convert(sandbox.lastResponse);
+            _appendToOutput(
+                'Last Response from Sandbox $sandboxId:\n$formattedJson');
           });
         }
       }
@@ -414,7 +446,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
           final result = await connection.generateBridgeId();
           final bridgeId = result['bridgeId'];
           final expiresAt = result['expiresAt'];
-          
+
           setState(() {
             _generatedBridgeIds.add({
               'id': bridgeId,
@@ -422,7 +454,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
               'expiresAt': expiresAt,
             });
           });
-          
+
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Bridge ID generated: $bridgeId')),
           );
@@ -543,7 +575,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
                           border: OutlineInputBorder(),
                           hintText: 'execute_jql',
                         ),
-                        enabled: _currentConnectionId != null && _selectedSandboxId != null,
+                        enabled: _currentConnectionId != null &&
+                            _selectedSandboxId != null,
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -553,18 +586,24 @@ class _MCPClientPageState extends State<MCPClientPage> {
                     child: TextField(
                       controller: _paramsController,
                       decoration: InputDecoration(
-                        labelText: _selectedMethod == 'tools/call' ? 'Tool Arguments (JSON)' : 'Parameters (JSON)',
+                        labelText: _selectedMethod == 'tools/call'
+                            ? 'Tool Arguments (JSON)'
+                            : 'Parameters (JSON)',
                         border: const OutlineInputBorder(),
-                        hintText: _selectedMethod == 'tools/call' 
-                          ? '{"jql": "project = GENIA"}'
-                          : '{}',
+                        hintText: _selectedMethod == 'tools/call'
+                            ? '{"jql": "project = GENIA"}'
+                            : '{}',
                       ),
-                      enabled: _currentConnectionId != null && _selectedSandboxId != null,
+                      enabled: _currentConnectionId != null &&
+                          _selectedSandboxId != null,
                     ),
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: _currentConnectionId != null && _selectedSandboxId != null ? () => _sendCommand() : null,
+                    onPressed: _currentConnectionId != null &&
+                            _selectedSandboxId != null
+                        ? () => _sendCommand()
+                        : null,
                     child: const Text('Send'),
                   ),
                 ],
@@ -583,23 +622,44 @@ class _MCPClientPageState extends State<MCPClientPage> {
                   children: [
                     Expanded(
                       child: SingleChildScrollView(
-                        controller: ScrollController(),
-                        child: SelectableText(
-                          _outputController.text,
-                          style: const TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 12,
+                        controller: _outputScrollController,
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 8.0),
+                          child: SelectableText(
+                            _outputController.text,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                            ),
                           ),
                         ),
                       ),
                     ),
                     Row(
-                      mainAxisAlignment: MainAxisAlignment.end,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
+                        IconButton(
+                          icon: const Icon(Icons.arrow_downward),
+                          tooltip: 'Scroll to bottom',
+                          onPressed: () {
+                            if (_outputScrollController.hasClients) {
+                              _outputScrollController.jumpTo(
+                                  _outputScrollController
+                                      .position.maxScrollExtent);
+                            }
+                          },
+                        ),
                         TextButton(
                           onPressed: () {
                             setState(() {
                               _outputController.clear();
+                              // Reset scroll position on clear
+                              WidgetsBinding.instance.addPostFrameCallback((_) {
+                                if (_outputScrollController.hasClients) {
+                                  _outputScrollController.jumpTo(0);
+                                }
+                              });
                             });
                           },
                           child: const Text('Clear'),
@@ -611,139 +671,150 @@ class _MCPClientPageState extends State<MCPClientPage> {
               ),
 
               // Bridge ID controls
-              if (_isConnected) Padding(
-                padding: const EdgeInsets.all(8.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    ElevatedButton(
-                      onPressed: _generateBridgeId,
-                      child: const Text('Generate Bridge ID'),
-                    ),
-                    if (_generatedBridgeIds.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      const Text('Generated Bridge IDs:'),
-                      Container(
-                        height: 100,
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.grey),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: ListView.builder(
-                          itemCount: _generatedBridgeIds.length,
-                          itemBuilder: (context, index) {
-                            final bridgeId = _generatedBridgeIds[index];
-                            final id = bridgeId['id'];
-                            final expiresAt = DateTime.fromMillisecondsSinceEpoch(bridgeId['expiresAt']);
-                            final now = DateTime.now();
-                            
-                            // Check if this bridge is connected
-                            final connection = _wsService.getConnection(_currentConnectionId!);
-                            final connectedBridge = connection?.connectedBridges
-                              .firstWhere(
+              if (_isConnected)
+                Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      ElevatedButton(
+                        onPressed: _generateBridgeId,
+                        child: const Text('Generate Bridge ID'),
+                      ),
+                      if (_generatedBridgeIds.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        const Text('Generated Bridge IDs:'),
+                        Container(
+                          height: 100,
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: ListView.builder(
+                            itemCount: _generatedBridgeIds.length,
+                            itemBuilder: (context, index) {
+                              final bridgeId = _generatedBridgeIds[index];
+                              final id = bridgeId['id'];
+                              final expiresAt =
+                                  DateTime.fromMillisecondsSinceEpoch(
+                                      bridgeId['expiresAt']);
+                              final now = DateTime.now();
+
+                              // Check if this bridge is connected
+                              final connection = _wsService
+                                  .getConnection(_currentConnectionId!);
+                              final connectedBridge =
+                                  connection?.connectedBridges.firstWhere(
                                 (b) => b['bridgeId'] == id,
                                 orElse: () => <String, dynamic>{},
                               );
-                            final isConnected = connectedBridge?.isNotEmpty ?? false;
-                            
-                            // Check if this bridge ID is valid (no expiration)
-                            final isValidated = connection?.validBridgeIds.contains(id) ?? false;
-                            
-                            // Only check expiration if not validated
-                            final isExpired = !isValidated && now.isAfter(expiresAt);
-                            
-                            return ListTile(
-                              leading: Icon(
-                                isConnected ? Icons.link : Icons.link_off,
-                                color: isConnected ? Colors.green : Colors.grey,
-                                size: 20,
-                              ),
-                              title: Text('ID: $id'),
-                              subtitle: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (isValidated)
-                                    const Text(
-                                      'Active - No Expiration',
-                                      style: TextStyle(
-                                        color: Colors.green,
-                                        fontWeight: FontWeight.bold,
+                              final isConnected =
+                                  connectedBridge?.isNotEmpty ?? false;
+
+                              // Check if this bridge ID is valid (no expiration)
+                              final isValidated =
+                                  connection?.validBridgeIds.contains(id) ??
+                                      false;
+
+                              // Only check expiration if not validated
+                              final isExpired =
+                                  !isValidated && now.isAfter(expiresAt);
+
+                              return ListTile(
+                                leading: Icon(
+                                  isConnected ? Icons.link : Icons.link_off,
+                                  color:
+                                      isConnected ? Colors.green : Colors.grey,
+                                  size: 20,
+                                ),
+                                title: Text('ID: $id'),
+                                subtitle: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    if (isValidated)
+                                      const Text(
+                                        'Active - No Expiration',
+                                        style: TextStyle(
+                                          color: Colors.green,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      )
+                                    else
+                                      Text(isExpired
+                                          ? 'Expired'
+                                          : 'Expires at ${expiresAt.hour.toString().padLeft(2, '0')}:${expiresAt.minute.toString().padLeft(2, '0')}:${expiresAt.second.toString().padLeft(2, '0')}'),
+                                    if (!isExpired && !isValidated)
+                                      Text(
+                                        'Remaining: ${_formatDuration(expiresAt.difference(now))}',
+                                        style: TextStyle(
+                                          color: Colors.grey[600],
+                                          fontSize: 12,
+                                        ),
                                       ),
-                                    )
-                                  else
-                                    Text(
-                                      isExpired 
-                                        ? 'Expired'
-                                        : 'Expires at ${expiresAt.hour.toString().padLeft(2, '0')}:${expiresAt.minute.toString().padLeft(2, '0')}:${expiresAt.second.toString().padLeft(2, '0')}'
-                                    ),
-                                  if (!isExpired && !isValidated)
-                                    Text(
-                                      'Remaining: ${_formatDuration(expiresAt.difference(now))}',
-                                      style: TextStyle(
-                                        color: Colors.grey[600],
-                                        fontSize: 12,
+                                    if (isConnected) ...[
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        'Platform: ${connectedBridge!['platform']}',
+                                        style: const TextStyle(
+                                          color: Colors.green,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.bold,
+                                        ),
                                       ),
-                                    ),
-                                  if (isConnected) ...[
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      'Platform: ${connectedBridge!['platform']}',
-                                      style: const TextStyle(
-                                        color: Colors.green,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.bold,
+                                      Text(
+                                        'Connected since: ${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).hour.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).minute.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).second.toString().padLeft(2, '0')}',
+                                        style: TextStyle(
+                                          color: Colors.grey[600],
+                                          fontSize: 12,
+                                        ),
                                       ),
-                                    ),
-                                    Text(
-                                      'Connected since: ${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).hour.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).minute.toString().padLeft(2, '0')}:${DateTime.fromMillisecondsSinceEpoch(connectedBridge['connectedAt']).second.toString().padLeft(2, '0')}',
-                                      style: TextStyle(
-                                        color: Colors.grey[600],
-                                        fontSize: 12,
-                                      ),
-                                    ),
+                                    ],
                                   ],
-                                ],
-                              ),
-                              tileColor: isExpired ? Colors.grey[200] : null,
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  if (!isExpired || isValidated)
+                                ),
+                                tileColor: isExpired ? Colors.grey[200] : null,
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (!isExpired || isValidated)
+                                      IconButton(
+                                        icon: const Icon(Icons.copy),
+                                        onPressed: () {
+                                          Clipboard.setData(
+                                                  ClipboardData(text: id))
+                                              .then((_) {
+                                            ScaffoldMessenger.of(context)
+                                                .showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                    'Bridge ID copied to clipboard'),
+                                                duration: Duration(seconds: 2),
+                                              ),
+                                            );
+                                          });
+                                        },
+                                        tooltip: 'Copy Bridge ID',
+                                        iconSize: 20,
+                                      ),
                                     IconButton(
-                                      icon: const Icon(Icons.copy),
+                                      icon: const Icon(Icons.delete),
                                       onPressed: () {
-                                        Clipboard.setData(ClipboardData(text: id)).then((_) {
-                                          ScaffoldMessenger.of(context).showSnackBar(
-                                            const SnackBar(
-                                              content: Text('Bridge ID copied to clipboard'),
-                                              duration: Duration(seconds: 2),
-                                            ),
-                                          );
+                                        setState(() {
+                                          _generatedBridgeIds.removeAt(index);
                                         });
                                       },
-                                      tooltip: 'Copy Bridge ID',
+                                      tooltip: 'Delete Bridge ID',
                                       iconSize: 20,
                                     ),
-                                  IconButton(
-                                    icon: const Icon(Icons.delete),
-                                    onPressed: () {
-                                      setState(() {
-                                        _generatedBridgeIds.removeAt(index);
-                                      });
-                                    },
-                                    tooltip: 'Delete Bridge ID',
-                                    iconSize: 20,
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
                         ),
-                      ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -815,21 +886,23 @@ class _MCPClientPageState extends State<MCPClientPage> {
               final info = entry.value;
               final isCurrentConnection = connectionId == _currentConnectionId;
               final connection = _wsService.getConnection(connectionId);
-              
+
               // Filtrer les sandboxes selon le filtre sélectionné
               final filteredSandboxes = connection?.sandboxes.where((sandbox) {
-                switch (_sandboxFilter) {
-                  case 'running':
-                    return sandbox.isRunning;
-                  case 'stopped':
-                    return !sandbox.isRunning;
-                  default:
-                    return true;
-                }
-              }).toList() ?? [];
+                    switch (_sandboxFilter) {
+                      case 'running':
+                        return sandbox.isRunning;
+                      case 'stopped':
+                        return !sandbox.isRunning;
+                      default:
+                        return true;
+                    }
+                  }).toList() ??
+                  [];
 
               return Card(
-                color: isCurrentConnection ? Colors.blue.withOpacity(0.1) : null,
+                color:
+                    isCurrentConnection ? Colors.blue.withOpacity(0.1) : null,
                 child: Padding(
                   padding: const EdgeInsets.all(8.0),
                   child: Column(
@@ -838,14 +911,19 @@ class _MCPClientPageState extends State<MCPClientPage> {
                       Row(
                         children: [
                           Icon(
-                            info['status'] == 'connected' ? Icons.link : Icons.link_off,
-                            color: info['status'] == 'connected' ? Colors.green : Colors.red,
+                            info['status'] == 'connected'
+                                ? Icons.link
+                                : Icons.link_off,
+                            color: info['status'] == 'connected'
+                                ? Colors.green
+                                : Colors.red,
                           ),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
                               'Session $connectionId',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.bold),
                             ),
                           ),
                           if (!isCurrentConnection)
@@ -887,11 +965,14 @@ class _MCPClientPageState extends State<MCPClientPage> {
                       Text('Status: ${info['status']}'),
                       if (filteredSandboxes.isNotEmpty) ...[
                         const SizedBox(height: 8),
-                        const Text('Sandboxes:', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const Text('Sandboxes:',
+                            style: TextStyle(fontWeight: FontWeight.bold)),
                         ...filteredSandboxes.map((sandbox) {
                           return Card(
                             margin: const EdgeInsets.only(top: 4),
-                            color: _selectedSandboxId == sandbox.id ? Colors.blue.withOpacity(0.1) : null,
+                            color: _selectedSandboxId == sandbox.id
+                                ? Colors.blue.withOpacity(0.1)
+                                : null,
                             child: InkWell(
                               onTap: () {
                                 _selectSandbox(sandbox.id);
@@ -904,18 +985,25 @@ class _MCPClientPageState extends State<MCPClientPage> {
                                     Row(
                                       children: [
                                         Icon(
-                                          sandbox.isRunning ? Icons.play_circle : Icons.stop_circle,
-                                          color: sandbox.isRunning ? Colors.green : Colors.red,
+                                          sandbox.isRunning
+                                              ? Icons.play_circle
+                                              : Icons.stop_circle,
+                                          color: sandbox.isRunning
+                                              ? Colors.green
+                                              : Colors.red,
                                           size: 16,
                                         ),
                                         const SizedBox(width: 8),
                                         Expanded(
                                           child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
                                             children: [
                                               Text(
                                                 'Script: ${sandbox.scriptPath}',
-                                                style: const TextStyle(fontWeight: FontWeight.bold),
+                                                style: const TextStyle(
+                                                    fontWeight:
+                                                        FontWeight.bold),
                                               ),
                                               if (sandbox.env.isNotEmpty) ...[
                                                 const SizedBox(height: 4),
@@ -926,12 +1014,16 @@ class _MCPClientPageState extends State<MCPClientPage> {
                                                     color: Colors.grey[600],
                                                   ),
                                                 ),
-                                                ...sandbox.env.entries.map((env) {
+                                                ...sandbox.env.entries
+                                                    .map((env) {
                                                   return Padding(
-                                                    padding: const EdgeInsets.only(left: 8.0),
+                                                    padding:
+                                                        const EdgeInsets.only(
+                                                            left: 8.0),
                                                     child: Text(
                                                       '${env.key}: ${env.value}',
-                                                      style: const TextStyle(fontSize: 12),
+                                                      style: const TextStyle(
+                                                          fontSize: 12),
                                                     ),
                                                   );
                                                 }),
@@ -941,13 +1033,17 @@ class _MCPClientPageState extends State<MCPClientPage> {
                                         ),
                                         if (_selectedSandboxId == sandbox.id)
                                           const Padding(
-                                            padding: EdgeInsets.only(right: 8.0),
-                                            child: Icon(Icons.check_circle, color: Colors.blue, size: 16),
+                                            padding:
+                                                EdgeInsets.only(right: 8.0),
+                                            child: Icon(Icons.check_circle,
+                                                color: Colors.blue, size: 16),
                                           ),
                                         if (sandbox.isRunning)
                                           IconButton(
-                                            icon: const Icon(Icons.stop, size: 16),
-                                            onPressed: () => _stopSandbox(sandbox.id),
+                                            icon: const Icon(Icons.stop,
+                                                size: 16),
+                                            onPressed: () =>
+                                                _stopSandbox(sandbox.id),
                                             tooltip: 'Arrêter la sandbox',
                                           ),
                                       ],
@@ -1032,11 +1128,14 @@ class _MCPClientPageState extends State<MCPClientPage> {
             ElevatedButton(
               onPressed: _currentConnectionId != null && _selectedScript != null
                   ? () {
-                      final connection = _wsService.getConnection(_currentConnectionId!);
+                      final connection =
+                          _wsService.getConnection(_currentConnectionId!);
                       if (connection != null) {
-                        final Map<String, String> env = _selectedEnvironment != null
-                            ? Map<String, String>.from(_savedEnvironments[_selectedEnvironment]!)
-                            : <String, String>{};
+                        final Map<String, String> env =
+                            _selectedEnvironment != null
+                                ? Map<String, String>.from(
+                                    _savedEnvironments[_selectedEnvironment]!)
+                                : <String, String>{};
                         connection.startSandbox(_selectedScript!, env);
                       }
                     }
@@ -1051,11 +1150,12 @@ class _MCPClientPageState extends State<MCPClientPage> {
 
   @override
   void dispose() {
-    _updateTimer?.cancel();
     _serverUrlController.dispose();
     _toolNameController.dispose();
     _paramsController.dispose();
     _outputController.dispose();
+    _outputScrollController.dispose();
+    _updateTimer?.cancel();
     if (_currentConnectionId != null) {
       _wsService.removeConnection(_currentConnectionId!);
     }
@@ -1091,20 +1191,15 @@ class _MCPClientPageState extends State<MCPClientPage> {
   _handleStdout(String p1) {
     // Handle stdout messages here
     print('STDOUT: $p1');
-    _outputController.text = '${_outputController.text}\nSTDOUT: $p1';
-    setState(() {
-      _outputController.selection = TextSelection.fromPosition(
-        TextPosition(offset: _outputController.text.length),
-      );
-    });
+    _appendToOutput('STDOUT: $p1');
   }
 
   String _formatDuration(Duration duration) {
     if (duration.isNegative) return 'Expired';
-    
+
     final minutes = duration.inMinutes;
     final seconds = duration.inSeconds % 60;
-    
+
     if (minutes > 0) {
       return '${minutes}m ${seconds}s';
     } else {
@@ -1135,7 +1230,8 @@ class AddScriptDialog extends StatefulWidget {
   State<AddScriptDialog> createState() => _AddScriptDialogState();
 }
 
-class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProviderStateMixin {
+class _AddScriptDialogState extends State<AddScriptDialog>
+    with SingleTickerProviderStateMixin {
   late TabController _tabController;
   final _scriptPathController = TextEditingController();
   final _envNameController = TextEditingController();
@@ -1165,7 +1261,8 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
   }
 
   void _addEnvVar() {
-    if (_envKeyController.text.isNotEmpty && _envValueController.text.isNotEmpty) {
+    if (_envKeyController.text.isNotEmpty &&
+        _envValueController.text.isNotEmpty) {
       setState(() {
         _currentEnv[_envKeyController.text] = _envValueController.text;
         _envKeyController.clear();
@@ -1184,7 +1281,8 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
     setState(() {
       _selectedEnvironment = name;
       if (name != null) {
-        _currentEnv = Map<String, String>.from(widget.savedEnvironments[name] ?? {});
+        _currentEnv =
+            Map<String, String>.from(widget.savedEnvironments[name] ?? {});
       } else {
         _currentEnv = {};
       }
@@ -1200,7 +1298,7 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
 
         final Map<String, dynamic> jsonData = jsonDecode(jsonStr);
         final newEnvVars = <String, String>{};
-        
+
         jsonData.forEach((key, value) {
           if (value is String) {
             newEnvVars[key] = value;
@@ -1382,7 +1480,8 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
                             IconButton(
                               onPressed: _selectedEnvironment != null
                                   ? () {
-                                      widget.onRemoveEnvironment(_selectedEnvironment!);
+                                      widget.onRemoveEnvironment(
+                                          _selectedEnvironment!);
                                       setState(() {
                                         _selectedEnvironment = null;
                                         _envNameController.clear();
@@ -1426,7 +1525,8 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
                                     TextButton(
                                       onPressed: () {
                                         setState(() {
-                                          _envJsonController.text = _exportEnvToJson();
+                                          _envJsonController.text =
+                                              _exportEnvToJson();
                                         });
                                       },
                                       child: const Text('Exporter'),
@@ -1496,7 +1596,8 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
                                 return Row(
                                   children: [
                                     Expanded(
-                                      child: Text('${entry.key}: ${entry.value}'),
+                                      child:
+                                          Text('${entry.key}: ${entry.value}'),
                                     ),
                                     IconButton(
                                       icon: const Icon(Icons.delete, size: 16),
@@ -1518,9 +1619,11 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
                             ),
                             const SizedBox(width: 8),
                             ElevatedButton(
-                              onPressed: _envNameController.text.isNotEmpty && _currentEnv.isNotEmpty
+                              onPressed: _envNameController.text.isNotEmpty &&
+                                      _currentEnv.isNotEmpty
                                   ? () {
-                                      widget.onSaveEnvironment(_envNameController.text, _currentEnv);
+                                      widget.onSaveEnvironment(
+                                          _envNameController.text, _currentEnv);
                                       Navigator.of(context).pop();
                                     }
                                   : null,
@@ -1539,4 +1642,4 @@ class _AddScriptDialogState extends State<AddScriptDialog> with SingleTickerProv
       ),
     );
   }
-} 
+}

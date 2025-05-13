@@ -40,14 +40,20 @@ export class Bridge {
         this.pendingRequests = new Map();
         // Request ID counter
         this.requestId = 0;
-        // Bridge connection status
+        // Bridge connection status - explicitly disconnected by default
         this._connected = false;
         this._bridgeId = null;
-        console.error('[BRIDGE] Instance created, connected:', this._connected);
+        console.error('[BRIDGE] Instance created, disconnected by default');
 
         // Default tool handler to return available tools
         this.onTool(async ({ action }) => {
             console.error('[BRIDGE] Tool handler called with action:', action);
+            // Only respond if the bridge is connected
+            if (!this.isConnected()) {
+                console.error('[BRIDGE] Tool handler ignoring request: bridge not connected');
+                return null;
+            }
+            
             if (action === 'list') {
                 return [
                     {
@@ -283,6 +289,11 @@ export class Bridge {
         }
     }
 
+    // Handler for stderr output from child process
+    handleStderr({ message }) {
+        return this.emit('stderr', { message });
+    }
+
     // Méthodes utilitaires pour les handlers
     async handleFetch(request) {
         return this.handleRequest('fetch', request);
@@ -338,7 +349,59 @@ export class Bridge {
         return this.handleRequest('command', params);
     }
 
+    // Forward intercepted calls from NodeInterceptor
+    async handleInterceptedCall(type, payload) {
+        // Don't process requests unless the bridge is actually connected
+        if (!this.isConnected()) {
+            console.error('[BRIDGE] Cannot handle intercepted call, bridge not connected');
+            return null; // Return null to indicate the bridge is not connected
+        }
+        
+        console.error(`[BRIDGE] Handling intercepted ${type} call`);
+        
+        switch (type) {
+            case 'fetch':
+            case 'http_request':
+            case 'https_request':
+                return this.handleFetch(payload);
+                
+            case 'net_connect':
+                return this.handleConnect(payload);
+                
+            case 'dns_lookup':
+                return this.handleDns(payload);
+                
+            case 'fs_readFile':
+                return this.handleFs({ action: 'read', ...payload });
+                
+            case 'fs_writeFile':
+                return this.handleFs({ action: 'write', ...payload });
+                
+            case 'fs_unlink':
+                return this.handleFs({ action: 'delete', ...payload });
+                
+            case 'fs_stat':
+                return this.handleFs({ action: 'stat', ...payload });
+                
+            case 'spawn':
+            case 'exec':
+                return this.handleSpawn(payload);
+                
+            case 'websocket_connect':
+                return this.handleWebSocket(payload);
+                
+            default:
+                console.error(`[BRIDGE] Unsupported intercepted call type: ${type}`);
+                return null;
+        }
+    }
+
     log(message, type = 'stdout') {
         this.emit(type, { message });
     }
+}
+
+// Add support for CommonJS require() in bundled scripts
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { Bridge, NullBridge };
 } 
