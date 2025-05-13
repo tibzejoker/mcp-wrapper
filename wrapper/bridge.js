@@ -6,6 +6,7 @@ export class Bridge {
             fetch: new Set(),          // Requêtes HTTP/HTTPS
             connect: new Set(),        // Connexions TCP/UDP
             dns: new Set(),            // Résolutions DNS
+            websocket: new Set(),      // WebSocket connections
 
             // Système de fichiers
             fileRead: new Set(),       // Lecture de fichiers
@@ -24,25 +25,122 @@ export class Bridge {
             // Modules
             import: new Set(),         // Import/require de modules
             
+            // Tools and Commands
+            tool: new Set(),           // Tool execution
+            command: new Set(),        // Command execution
+            
             // Erreurs et événements système
             error: new Set(),          // Erreurs générales
             exit: new Set()            // Sortie du processus
         };
+
+        // Keep track of active WebSocket connections
+        this.activeWebSockets = new Map();
+        // Keep track of pending requests
+        this.pendingRequests = new Map();
+        // Request ID counter
+        this.requestId = 0;
+        // Bridge connection status
+        this._connected = false;
+        this._bridgeId = null;
+        console.error('[BRIDGE] Instance created, connected:', this._connected);
+
+        // Default tool handler to return available tools
+        this.onTool(async ({ action }) => {
+            console.error('[BRIDGE] Tool handler called with action:', action);
+            if (action === 'list') {
+                return [
+                    {
+                        name: 'execute_jql',
+                        description: 'Execute a JQL query',
+                        parameters: {
+                            jql: { type: 'string', description: 'JQL query to execute' }
+                        }
+                    }
+                ];
+            }
+            throw new Error(`Unknown tool action: ${action}`);
+        });
+    }
+
+    // Helper method to emit debug messages
+    emitDebug(...args) {
+        const message = ['[BRIDGE_DEBUG]', ...args].join(' ');
+        if (this.handlers.stdout.size > 0) {
+            this.emit('stdout', { message });
+        } else {
+            console.error(message);
+        }
+    }
+
+    // Set bridge ID
+    setBridgeId(id) {
+        console.error('[BRIDGE] Setting bridge ID:', id);
+        this._bridgeId = id;
+    }
+
+    // Get bridge ID
+    getBridgeId() {
+        return this._bridgeId;
+    }
+
+    // Check if bridge is connected
+    isConnected() {
+        const status = this._connected && this._bridgeId !== null;
+        console.error('[BRIDGE] isConnected() called:', status, '(connected:', this._connected, 'bridgeId:', this._bridgeId, ')');
+        return status;
+    }
+
+    // Set bridge connection status
+    setConnected(status) {
+        console.error('[BRIDGE] setConnected() called, old:', this._connected, 'new:', status, 'bridgeId:', this._bridgeId);
+        this._connected = status;
+
+        // Send immediate response when bridge is connected
+        if (status) {
+            console.error('[BRIDGE] Connected, sending initial tools list');
+            const response = {
+                jsonrpc: '2.0',
+                result: {
+                    tools: [
+                        {
+                            name: 'execute_jql',
+                            description: 'Execute a JQL query',
+                            parameters: {
+                                jql: { type: 'string', description: 'JQL query to execute' }
+                            }
+                        }
+                    ]
+                }
+            };
+            // Use direct handler call instead of emit to avoid recursion
+            for (const handler of this.handlers.stdout) {
+                handler({ message: JSON.stringify(response) });
+            }
+        }
     }
 
     // Méthodes pour ajouter des handlers
     onFetch(handler) {
+        this.emitDebug('Adding fetch handler');
         this.handlers.fetch.add(handler);
-        return this; // Pour le chaînage
+        return this;
     }
 
     onConnect(handler) {
+        this.emitDebug('Adding connect handler');
         this.handlers.connect.add(handler);
         return this;
     }
 
     onDns(handler) {
         this.handlers.dns.add(handler);
+        return this;
+    }
+
+    onWebSocket(handler) {
+        this.emitDebug('Adding websocket handler');
+        this.handlers.websocket.add(handler);
         return this;
     }
 
@@ -91,6 +189,17 @@ export class Bridge {
         return this;
     }
 
+    onTool(handler) {
+        this.emitDebug('Adding tool handler');
+        this.handlers.tool.add(handler);
+        return this;
+    }
+
+    onCommand(handler) {
+        this.handlers.command.add(handler);
+        return this;
+    }
+
     onError(handler) {
         this.handlers.error.add(handler);
         return this;
@@ -103,37 +212,130 @@ export class Bridge {
 
     // Méthodes pour émettre des événements
     async emit(eventName, data) {
+        console.error('[BRIDGE] emit() called', { eventName, data });
         if (!this.handlers[eventName]) {
+            console.error('[BRIDGE] Event not supported:', eventName);
             throw new Error(`Event "${eventName}" not supported`);
         }
 
         const results = [];
         for (const handler of this.handlers[eventName]) {
             try {
+                console.error('[BRIDGE] Calling handler for event:', eventName);
                 const result = await handler(data);
                 results.push(result);
+                console.error('[BRIDGE] Handler result:', result);
             } catch (error) {
-                this.emit('error', { source: eventName, error });
+                console.error('[BRIDGE] Handler error:', error);
+                // Don't recursively emit error events
+                if (eventName !== 'error') {
+                    for (const errorHandler of this.handlers.error) {
+                        try {
+                            await errorHandler({ source: eventName, error });
+                        } catch (e) {
+                            console.error('[BRIDGE] Error handler failed:', e);
+                        }
+                    }
+                }
             }
         }
         return results;
     }
 
-    // Méthodes utilitaires pour les handlers par défaut
+    // Generate a unique request ID
+    generateRequestId() {
+        return `req_${++this.requestId}`;
+    }
+
+    // Handle a request and wait for response
+    async handleRequest(type, data) {
+        console.error('[BRIDGE] handleRequest() called', { type, data });
+        const requestId = this.generateRequestId();
+        
+        return new Promise((resolve, reject) => {
+            console.error('[BRIDGE] Creating pending request:', requestId);
+            this.pendingRequests.set(requestId, { resolve, reject });
+            
+            this.emit(type, { ...data, requestId })
+                .catch(error => {
+                    console.error('[BRIDGE] Request failed:', requestId, error);
+                    this.pendingRequests.delete(requestId);
+                    reject(error);
+                });
+        });
+    }
+
+    // Handle response from the bridge portal
+    handleResponse(requestId, response, error = null) {
+        console.error('[BRIDGE] handleResponse() called', { requestId, response, error });
+        const pending = this.pendingRequests.get(requestId);
+        if (pending) {
+            if (error) {
+                console.error('[BRIDGE] Rejecting request:', requestId, error);
+                pending.reject(error);
+            } else {
+                console.error('[BRIDGE] Resolving request:', requestId, response);
+                pending.resolve(response);
+            }
+            this.pendingRequests.delete(requestId);
+        } else {
+            console.error('[BRIDGE] No pending request found for:', requestId);
+        }
+    }
+
+    // Méthodes utilitaires pour les handlers
     async handleFetch(request) {
-        const results = await this.emit('fetch', request);
-        // Si au moins un handler retourne false, bloquer la requête
-        return !results.includes(false);
+        return this.handleRequest('fetch', request);
     }
 
-    async handleFileAccess(type, path, options = {}) {
-        const results = await this.emit(type, { path, options });
-        return !results.includes(false);
+    async handleWebSocket(params) {
+        const { action, ...rest } = params;
+        switch (action) {
+            case 'connect':
+                const wsId = this.generateRequestId();
+                const connection = await this.handleRequest('websocket', { ...rest, wsId });
+                this.activeWebSockets.set(wsId, connection);
+                return { wsId, ...connection };
+
+            case 'send':
+                const ws = this.activeWebSockets.get(params.wsId);
+                if (!ws) throw new Error('WebSocket connection not found');
+                return this.handleRequest('websocket', { action: 'send', ws, ...rest });
+
+            case 'close':
+                const wsToClose = this.activeWebSockets.get(params.wsId);
+                if (wsToClose) {
+                    await this.handleRequest('websocket', { action: 'close', ws: wsToClose });
+                    this.activeWebSockets.delete(params.wsId);
+                }
+                return true;
+
+            default:
+                throw new Error(`Unknown WebSocket action: ${action}`);
+        }
     }
 
-    async handleProcess(command, args, options = {}) {
-        const results = await this.emit('spawn', { command, args, options });
-        return !results.includes(false);
+    async handleFs(params) {
+        const { action, ...rest } = params;
+        switch (action) {
+            case 'readFile':
+                return this.handleRequest('fileRead', rest);
+            case 'writeFile':
+                return this.handleRequest('fileWrite', rest);
+            case 'deleteFile':
+                return this.handleRequest('fileDelete', rest);
+            default:
+                throw new Error(`Unknown filesystem action: ${action}`);
+        }
+    }
+
+    async handleToolCall(params) {
+        const { name, arguments: args } = params;
+        return this.handleRequest('tool', { name, arguments: args });
+    }
+
+    async handleCommand(params) {
+        return this.handleRequest('command', params);
     }
 
     log(message, type = 'stdout') {

@@ -19,6 +19,16 @@ class Sandbox {
         this.bridge.onFetch(() => false);
         this.bridge.onConnect(() => false);
         this.bridge.onDns(() => false);
+
+        // Listen for bridge registration
+        process.on('message', (message) => {
+            if (message.type === 'bridge_register') {
+                console.error('[SANDBOX] Bridge registration received:', message.bridgeId);
+                this.bridge.setBridgeId(message.bridgeId);
+                this.bridge.setConnected(true);
+                console.error('[SANDBOX] Bridge connection status updated:', this.bridge.isConnected());
+            }
+        });
     }
 
     // Getter pour accéder au bridge
@@ -395,9 +405,14 @@ except Exception as e:
         });
     }
 
+    // Helper method to log debug messages
+    emitDebug(...args) {
+        console.error(['[SANDBOX]', ...args].join(' '));
+    }
+
     // Exécute un script Node.js
     async runNodeScript(scriptPath) {
-        console.log('Exécution du script Node.js :', scriptPath);
+        this.emitDebug('Executing Node.js script:', scriptPath);
         const content = fs.readFileSync(scriptPath, 'utf8');
         
         // Détection du type de module
@@ -423,33 +438,63 @@ global.__dirname = dirname(global.__filename);
 // Convert the path to a proper file URL
 const scriptUrl = new URL('file://' + '${scriptPath.replace(/\\/g, '/')}');
 
-// Function to kill a process and its children on Windows
-async function killProcessWindows(pid) {
-    return new Promise((resolve, reject) => {
-        const taskkill = spawn('taskkill', ['/pid', pid, '/T', '/F']);
-        taskkill.on('close', (code) => {
-            if (code === 0) {
-                resolve();
-            } else {
-                reject(new Error(\`taskkill exited with code \${code}\`));
-            }
-        });
-    });
-}
+// Create a proxy for all network requests
+const networkProxy = {
+    fetch: async (url, options = {}) => {
+        // Send request details to parent process
+        const request = {
+            type: 'fetch',
+            url,
+            options
+        };
+        return new Promise((resolve, reject) => {
+            const requestId = Date.now();
+            process.stdout.write(JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'bridge_request',
+                id: requestId,
+                params: request
+            }) + '\\n');
 
-// Handle process termination
-process.on('SIGTERM', async () => {
+            // Set up response handler
+            const responseHandler = (data) => {
+                try {
+                    const response = JSON.parse(data);
+                    if (response.jsonrpc === '2.0' && response.id === requestId) {
+                        if (response.error) {
+                            reject(new Error(response.error.message));
+                        } else {
+                            resolve(response.result);
+                        }
+                        process.stdin.removeListener('data', responseHandler);
+                    }
+                } catch (e) {
+                    // Ignore non-JSON or unrelated messages
+                }
+            };
+
+            process.stdin.on('data', responseHandler);
+        });
+    }
+};
+
+// Setup message handling from parent process
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (data) => {
     try {
-        if (process.platform === 'win32') {
-            await killProcessWindows(process.pid);
-        } else {
-            process.exit(0);
+        const message = JSON.parse(data);
+        if (message.jsonrpc === '2.0') {
+            if (message.error) {
+                console.error('[Bridge Error]', message.error.message);
+            }
         }
-    } catch (err) {
-        console.error('Error during process termination:', err);
-        process.exit(1);
+    } catch (error) {
+        // Ignore parse errors for non-JSON messages
     }
 });
+
+// Inject proxies into global scope
+global.fetch = networkProxy.fetch;
 
 // Import and run the actual script
 import(scriptUrl)
@@ -485,17 +530,176 @@ import(scriptUrl)
             // Écouter les sorties du processus
             child.stdout.on('data', (data) => {
                 try {
-                    // Essayer de parser la réponse JSON
-                    const response = JSON.parse(data.toString());
-                    console.log('[DEBUG] Réponse JSON reçue:', response);
-                    if (this.bridge) {
-                        this.bridge.emit('stdout', { message: data.toString(), isJson: true });
+                    this.emitDebug('Raw stdout:', data.toString());
+                    const message = JSON.parse(data.toString());
+                    this.emitDebug('Parsed message:', JSON.stringify(message, null, 2));
+                    
+                    if (message.jsonrpc === '2.0') {
+                        this.emitDebug('Bridge connection status:', this.bridge?.isConnected());
+                        this.emitDebug('Bridge instance exists:', !!this.bridge);
+                        
+                        // Handle both bridge requests and direct JSON-RPC methods
+                        if (message.method === 'bridge_request') {
+                            this.emitDebug('Handling bridge_request');
+                            // Check if bridge is connected
+                            if (!this.bridge || !this.bridge.isConnected()) {
+                                this.emitDebug('Bridge not connected, sending error response');
+                                const response = {
+                                    jsonrpc: '2.0',
+                                    id: message.id,
+                                    error: {
+                                        code: -32001,
+                                        message: 'Bridge not connected',
+                                        data: {
+                                            details: 'Operation cannot be executed because the bridge is not connected.',
+                                            requestType: message.params.type
+                                        }
+                                    }
+                                };
+                                this.emitDebug('Error response:', JSON.stringify(response, null, 2));
+                                child.stdin.write(JSON.stringify(response) + '\n');
+                                return;
+                            }
+
+                            this.emitDebug('Routing request through bridge');
+                            // Route the request through the bridge
+                            const { type, ...params } = message.params;
+                            this.bridge.handleRequest(type, params)
+                                .then(response => {
+                                    this.emitDebug('Bridge request succeeded:', JSON.stringify(response, null, 2));
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        result: response
+                                    }) + '\n');
+                                })
+                                .catch(error => {
+                                    this.emitDebug('Bridge request failed:', error);
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        error: {
+                                            code: -32000,
+                                            message: error.message
+                                        }
+                                    }) + '\n');
+                                });
+                        } else if (message.method === 'tools/list') {
+                            this.emitDebug('Handling tools/list');
+                            // Check if bridge is connected for tools/list
+                            this.emitDebug('Bridge exists:', !!this.bridge);
+                            if (this.bridge) {
+                                this.emitDebug('Bridge ID:', this.bridge.getBridgeId());
+                                this.emitDebug('Bridge connected status:', this.bridge.isConnected());
+                            }
+                            if (!this.bridge || !this.bridge.isConnected()) {
+                                this.emitDebug('Bridge not connected for tools/list, sending error response');
+                                child.stdin.write(JSON.stringify({
+                                    jsonrpc: '2.0',
+                                    id: message.id,
+                                    error: {
+                                        code: -32001,
+                                        message: 'Bridge not connected',
+                                        data: {
+                                            details: 'Tool listing is not available because the bridge is not connected.'
+                                        }
+                                    }
+                                }) + '\n');
+                                return;
+                            }
+
+                            this.emitDebug('Forwarding tools/list to bridge');
+                            // Forward tools/list request to bridge
+                            this.bridge.handleRequest('tool', { action: 'list' })
+                                .then(tools => {
+                                    this.emitDebug('Tools list received:', JSON.stringify(tools, null, 2));
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        result: { tools }
+                                    }) + '\n');
+                                })
+                                .catch(error => {
+                                    this.emitDebug('Tools list failed:', error);
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        error: {
+                                            code: -32000,
+                                            message: error.message
+                                        }
+                                    }) + '\n');
+                                });
+                        } else if (message.method === 'tools/call') {
+                            this.emitDebug('Handling tools/call');
+                            // Check if bridge is connected for tools/call
+                            if (!this.bridge || !this.bridge.isConnected()) {
+                                this.emitDebug('Bridge not connected for tools/call');
+                                child.stdin.write(JSON.stringify({
+                                    jsonrpc: '2.0',
+                                    id: message.id,
+                                    error: {
+                                        code: -32001,
+                                        message: 'Bridge not connected',
+                                        data: {
+                                            details: 'Tool execution is not available because the bridge is not connected.',
+                                            tool: message.params?.name
+                                        }
+                                    }
+                                }) + '\n');
+                                return;
+                            }
+
+                            this.emitDebug('Forwarding tool call to bridge:', message.params?.name);
+                            // Forward tool call to bridge
+                            this.bridge.handleRequest('tool', { 
+                                action: 'call',
+                                ...message.params 
+                            })
+                                .then(result => {
+                                    this.emitDebug('Tool call succeeded:', JSON.stringify(result, null, 2));
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        result
+                                    }) + '\n');
+                                })
+                                .catch(error => {
+                                    this.emitDebug('Tool call failed:', error);
+                                    child.stdin.write(JSON.stringify({
+                                        jsonrpc: '2.0',
+                                        id: message.id,
+                                        error: {
+                                            code: -32000,
+                                            message: error.message
+                                        }
+                                    }) + '\n');
+                                });
+                        } else {
+                            this.emitDebug('Unknown method:', message.method);
+                            // Handle unknown methods
+                            child.stdin.write(JSON.stringify({
+                                jsonrpc: '2.0',
+                                id: message.id,
+                                error: {
+                                    code: -32601,
+                                    message: `Method not found: ${message.method}`
+                                }
+                            }) + '\n');
+                        }
+                    } else {
+                        this.emitDebug('Non-JSON-RPC message:', data.toString());
+                        // Forward regular stdout messages
+                        if (this.bridge) {
+                            this.bridge.emit('stdout', { message: data.toString() });
+                        }
                     }
                 } catch (e) {
-                    // Si ce n'est pas du JSON, envoyer comme texte brut
-                    console.log('[DEBUG] Sortie standard:', data.toString());
+                    this.emitDebug('Error processing message:', e);
+                    this.emitDebug('Raw message that caused error:', data.toString());
+                    // If parsing fails, treat as regular stdout
                     if (this.bridge) {
-                        this.bridge.emit('stdout', { message: data.toString(), isJson: false });
+                        this.bridge.emit('stdout', { message: data.toString() });
                     }
                 }
             });
