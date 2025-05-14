@@ -3,13 +3,27 @@ import path from 'path';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import { spawn } from 'child_process';
+import crypto from 'crypto'; // Added for UUIDs
 
 console.log('🚀 Serveur démarré avec nodemon - Test de rechargement automatique!');
+
+// Add a DEBUG flag at the top of the file, right after imports
+const PORT = process.env.PORT || 3000;
+const DEBUG = false;  // Set to true to enable debug logs
+
+// Replace the debug logging function
+function debugLog(...args) {
+    if (DEBUG) {
+        console.log(...args);
+    }
+}
 
 // Stockage des sessions actives
 const sessions = new Map();
 const activeBridgeIds = new Map(); // Changed to Map to store timeout info
 const connectedBridges = new Map(); // Track connected bridges and their info
+const pendingSandboxRequests = new Map(); // Added: track requests forwarded to Flutter bridges
+const sandboxBridgeAssignments = new Map(); // Map to track which sandbox is assigned to which bridge
 
 // Fonction pour générer un ID de bridge unique
 function generateBridgeId() {
@@ -80,7 +94,8 @@ function broadcastBridgeStatus() {
         bridgeId,
         platform: info.platform,
         connectedAt: info.connectedAt,
-        status: 'connected'
+        status: 'connected',
+        capabilities: info.capabilities // Also include capabilities if available
     }));
 
     const message = JSON.stringify({
@@ -98,6 +113,61 @@ function broadcastBridgeStatus() {
         if (session.ws && session.ws.readyState === 1) {
             session.ws.send(message);
             session.ws.send(bridgeValidationMessage);
+        }
+    });
+}
+
+// Function to get an available bridge ID (first connected bridge or null)
+function getFirstAvailableBridgeId() {
+    if (connectedBridges.size > 0) {
+        // Return the first bridge ID from the connected bridges
+        return Array.from(connectedBridges.keys())[0];
+    }
+    return null;
+}
+
+// Function to assign a bridge to a sandbox
+function assignBridgeToSandbox(sandboxId, bridgeId) {
+    sandboxBridgeAssignments.set(sandboxId, bridgeId);
+    debugLog(`[MAIN] Assigned bridge ${bridgeId} to sandbox ${sandboxId}`);
+    
+    // Update any unassigned sandboxes when a new bridge connects
+    broadcastBridgeAssignments();
+}
+
+// Function to get the bridge ID assigned to a sandbox
+function getBridgeForSandbox(sandboxId) {
+    return sandboxBridgeAssignments.get(sandboxId);
+}
+
+// Function to assign any unassigned sandboxes to a newly connected bridge
+function assignUnassignedSandboxesToBridge(bridgeId) {
+    // Get all sandboxes without a bridge assignment
+    sessions.forEach((session, sessionId) => {
+        session.sandboxes.forEach((sandboxInfo, sandboxId) => {
+            if (!sandboxBridgeAssignments.has(sandboxId)) {
+                assignBridgeToSandbox(sandboxId, bridgeId);
+                debugLog(`[MAIN] Auto-assigned newly connected bridge ${bridgeId} to sandbox ${sandboxId}`);
+            }
+        });
+    });
+}
+
+// Function to broadcast bridge assignments to clients
+function broadcastBridgeAssignments() {
+    const assignments = {};
+    sandboxBridgeAssignments.forEach((bridgeId, sandboxId) => {
+        assignments[sandboxId] = bridgeId;
+    });
+    
+    const message = JSON.stringify({
+        type: 'bridge_assignments_update',
+        assignments
+    });
+    
+    sessions.forEach(session => {
+        if (session.ws && session.ws.readyState === 1) {
+            session.ws.send(message);
         }
     });
 }
@@ -297,6 +367,70 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'bridge_register': {
+                    // Bridge portal registering with server
+                    console.log(`\n🔗 [FLOW] Bridge registration: ID ${message.bridgeId}, Origin: ${message.origin}`);
+                    
+                    // Handle the bridge registration
+                    if (message.origin === 'flutter_bridge_portal') {
+                        // This is a bridge portal connecting
+                        const bridgeId = message.bridgeId;
+                        if (!bridgeId) {
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                error: 'Bridge ID is required for registration',
+                                requestId: message.requestId
+                            }));
+                            break;
+                        }
+                        
+                        // Store bridge portal information
+                        connectedBridges.set(bridgeId, {
+                            ws: ws,
+                            platform: message.platform || 'unknown',
+                            capabilities: message.capabilities || [],
+                            connectedAt: Date.now()
+                        });
+                        
+                        // Tag this WebSocket as a bridge portal
+                        ws.isBridgePortal = true;
+                        ws.bridgeId = bridgeId;
+                        
+                        console.log(`[MAIN] Bridge portal registered with ID ${bridgeId}`);
+                        
+                        // Acknowledge bridge registration
+                        ws.send(JSON.stringify({
+                            type: 'bridge_registered',
+                            bridgeId: bridgeId,
+                            requestId: message.requestId
+                        }));
+                        
+                        // Assign any unassigned sandboxes to this newly connected bridge
+                        assignUnassignedSandboxesToBridge(bridgeId);
+                        
+                        // Broadcast bridge status update to clients
+                        broadcastBridgeStatus();
+                        // Broadcast bridge assignments
+                        broadcastBridgeAssignments();
+                    }
+                    // Registration from a Sandbox's Bridge Client
+                    if (message.origin === 'sandbox_bridge_client') {
+                        if (!message.bridgeId || !connectedBridges.has(message.bridgeId)) {
+                             ws.send(JSON.stringify({ type: 'error', requestId: message.requestId, error: 'Target Flutter Bridge ID not provided or not connected.' }));
+                             ws.close();
+                             return;
+                        }
+                        ws.isSandboxBridgeClient = true;
+                        ws.sandboxSessionId = message.sandboxSessionId; // The client session that owns the sandbox
+                        ws.targetFlutterBridgeId = message.bridgeId; // The Flutter bridge this sandbox client talks to
+                        ws.bridgeClientInstanceId = message.instanceId; // Unique ID for this specific sandbox bridge client
+
+                        console.log(`\n🔗 Sandbox Bridge Client registered: instanceId=${message.instanceId}, targetFlutterBridgeId=${message.bridgeId}, for client session ${message.sandboxSessionId}`);
+                        ws.send(JSON.stringify({ type: 'bridge_registered', requestId: message.requestId, bridgeClientInstanceId: message.instanceId }));
+                        // No broadcast needed for sandbox client registration itself
+                        break;
+                    }
+
+                    // Registration from a Flutter Bridge Portal
                     if (!message.bridgeId || !validateBridgeId(message.bridgeId)) {
                         ws.send(JSON.stringify({
                             type: 'error',
@@ -307,14 +441,18 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     
-                    // Store bridge connection info
+                    // Store bridge connection info for Flutter Bridge Portal
+                    ws.isFlutterBridge = true;
+                    ws.bridgeId = message.bridgeId; // Store bridgeId on the ws object for Flutter bridges
+
                     connectedBridges.set(message.bridgeId, {
                         platform: message.platform || 'unknown',
                         connectedAt: Date.now(),
-                        ws: ws
+                        ws: ws,
+                        capabilities: null // Initialize capabilities
                     });
 
-                    console.log(`\n🔗 Bridge registered with ID: ${message.bridgeId}, Platform: ${message.platform || 'unknown'}`);
+                    console.log(`\n🔗 Flutter Bridge Portal registered with ID: ${message.bridgeId}, Platform: ${message.platform || 'unknown'}`);
                     ws.send(JSON.stringify({
                         type: 'bridge_registered',
                         bridgeId: message.bridgeId
@@ -322,6 +460,126 @@ wss.on('connection', (ws) => {
 
                     // Broadcast updated bridge status to all clients
                     broadcastBridgeStatus();
+                    break;
+                }
+
+                case 'bridge_capabilities_report':
+                    if (message.bridgeId && message.capabilities) {
+                        const clientBridgeInfo = connectedBridges.get(message.bridgeId);
+                        if (clientBridgeInfo && clientBridgeInfo.ws === ws) {
+                            clientBridgeInfo.capabilities = message.capabilities;
+                            console.log(`\n📊 Received and stored capabilities from bridge ${message.bridgeId}:`, message.capabilities);
+                            // Optionally, send an ack if needed, though not strictly necessary for a report
+                            // ws.send(JSON.stringify({ type: 'capabilities_received', bridgeId: message.bridgeId }));
+                        } else {
+                            console.warn(`⚠️ Received bridge_capabilities_report for bridge ${message.bridgeId} from an unexpected WebSocket session or bridge not found.`);
+                            // ws.send(JSON.stringify({ type: 'error', error: 'Invalid session for capabilities report' }));
+                        }
+                    } else {
+                        console.warn('⚠️ Received malformed bridge_capabilities_report:', message);
+                        // ws.send(JSON.stringify({ type: 'error', error: 'Malformed capabilities report' }));
+                    }
+                    break;
+
+                // Intercepted calls from Sandbox Bridge Client to be forwarded to Flutter Bridge
+                case 'fs_read':
+                case 'fs_write':
+                case 'fs_stat':
+                case 'fs_list': // Assuming 'fs_list' will be a type
+                case 'fs_mkdir':
+                case 'fs_rmdir':
+                case 'fs_unlink':
+                case 'http_request':
+                // Add other interceptable types here, e.g. 'child_process_spawn', 'dns_lookup'
+                {
+                    if (!ws.isSandboxBridgeClient) {
+                        console.warn(`⚠️ Received ${message.type} from non-sandbox-bridge client:`, ws.sandboxSessionId || sessionId);
+                        ws.send(JSON.stringify({ type: 'bridge_response', requestId: message.requestId, response: { error: 'Operation only allowed for sandbox bridge clients.' } }));
+                        break;
+                    }
+
+                    // Эти поля теперь приходят от wrapper/bridge.js
+                    const targetFlutterBridgeId = message.targetFlutterBridgeId; 
+                    const sandboxSessionIdFromMsg = message.sandboxSessionId;
+                    const actualSandboxIdFromMsg = message.actualSandboxId;
+                    const originalRequestIdFromSandbox = message.requestId;
+
+                    if (!targetFlutterBridgeId || !sandboxSessionIdFromMsg || !actualSandboxIdFromMsg) {
+                        console.error(`❌ Missing routing info in ${message.type} from sandbox client: targetFlutterBridgeId, sandboxSessionId, or actualSandboxId.`);
+                        ws.send(JSON.stringify({ type: 'bridge_response', requestId: originalRequestIdFromSandbox, response: { error: 'Internal server error: Missing routing information from sandbox client.' } }));
+                        break;
+                    }
+
+                    const flutterBridgeInfo = connectedBridges.get(targetFlutterBridgeId);
+
+                    if (!flutterBridgeInfo || !flutterBridgeInfo.ws) {
+                        console.error(`❌ Target Flutter bridge ${targetFlutterBridgeId} not found or disconnected for ${message.type}`);
+                        ws.send(JSON.stringify({ type: 'bridge_response', requestId: originalRequestIdFromSandbox, response: { error: `Target Flutter bridge ${targetFlutterBridgeId} not available.` } }));
+                        break;
+                    }
+
+                    const forwardedRequestId = crypto.randomUUID(); // Unique ID for main.js <-> Flutter Portal leg
+                    pendingSandboxRequests.set(forwardedRequestId, {
+                        originalRequestId: originalRequestIdFromSandbox,
+                        sandboxClientWs: ws, // The WebSocket of the sandbox_bridge_client
+                        originalType: message.type,
+                        // Store for routing the response back correctly
+                        targetFlutterBridgeId: targetFlutterBridgeId,
+                        sandboxSessionId: sandboxSessionIdFromMsg,
+                        actualSandboxId: actualSandboxIdFromMsg
+                    });
+
+                    const requestToFlutter = {
+                        // method: message.type, // Use 'method' for JSON-RPC style to Flutter
+                        // Use the original type for now, BridgeService expects these types directly
+                        type: message.type, 
+                        requestId: forwardedRequestId, // This is for main.js <-> Flutter Portal tracking
+                        payload: message.payload,
+                        // Echo these back from Flutter Portal in its response so main.js can route to the correct sandbox client
+                        routingInfo: {
+                            targetFlutterBridgeId: targetFlutterBridgeId,
+                            sandboxSessionId: sandboxSessionIdFromMsg,
+                            actualSandboxId: actualSandboxIdFromMsg
+                        }
+                    };
+
+                    console.log(`\n↪️ Forwarding ${message.type} (sandboxReqId: ${originalRequestIdFromSandbox} -> mainFwdId: ${forwardedRequestId}) to Flutter bridge ${targetFlutterBridgeId}`);
+                    flutterBridgeInfo.ws.send(JSON.stringify(requestToFlutter));
+                    break;
+                }
+
+                // Response from Flutter Bridge Portal to be routed back to Sandbox Bridge Client
+                case 'bridge_response_from_portal': {
+                    if (!ws.isFlutterBridge) {
+                        console.warn(`⚠️ Received 'bridge_response_from_portal' from non-Flutter bridge:`, sessionId);
+                        break;
+                    }
+
+                    const forwardedRequestId = message.requestId; // This was generated by main.js for the main.js <-> Flutter leg
+                    const pendingReq = pendingSandboxRequests.get(forwardedRequestId);
+
+                    if (!pendingReq) {
+                        console.error(`❌ No pending sandbox request found for forwardedRequestId: ${forwardedRequestId} from Flutter bridge ${ws.bridgeId}`);
+                        break;
+                    }
+                    pendingSandboxRequests.delete(forwardedRequestId);
+
+                    // const { originalRequestId, sandboxClientWs, originalType, sandboxSessionId, actualSandboxId } = pendingReq;
+                    // The sandboxClientWs is the key. The other stored IDs (sandboxSessionId, actualSandboxId) were for context/logging if needed here.
+                    const { originalRequestId, sandboxClientWs, originalType } = pendingReq;
+
+
+                    if (sandboxClientWs && sandboxClientWs.readyState === 1) { // 1 = OPEN
+                        const responseToSandbox = {
+                            type: 'bridge_response', // Generic response type for wrapper/bridge.js
+                            requestId: originalRequestId, // The ID the sandbox client is waiting for
+                            response: message.response // This is the {data: ..., error: ...} part from Flutter
+                        };
+                        console.log(`\n↩️ Routing response for ${originalType} (mainFwdId: ${forwardedRequestId} -> sandboxReqId: ${originalRequestId}) back to sandbox client (instance: ${sandboxClientWs.bridgeClientInstanceId})`);
+                        sandboxClientWs.send(JSON.stringify(responseToSandbox));
+                    } else {
+                        console.warn(`⚠️ Sandbox client for originalRequestId ${originalRequestId} (forwarded ${forwardedRequestId}, instance: ${sandboxClientWs ? sandboxClientWs.bridgeClientInstanceId : 'N/A'}) is disconnected or not available.`);
+                    }
                     break;
                 }
 
@@ -336,9 +594,14 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'start':
-                    // Démarrer une nouvelle sandbox
-                    if (!message.config || !message.config.scriptPath) {
-                        throw new Error('Chemin du script requis');
+                    console.log(`\n▶️ Start request received from session ${sessionId}`);
+                    // If targetFlutterBridgeId is not specified, use the first available bridge
+                    const targetBridgeId = message.config?.targetFlutterBridgeId || getFirstAvailableBridgeId();
+                    const sandboxId = message.sandboxId || crypto.randomUUID();
+                    
+                    // If we have a bridge ID, assign it to this sandbox
+                    if (targetBridgeId) {
+                        assignBridgeToSandbox(sandboxId, targetBridgeId);
                     }
 
                     console.log(`\n🚀 Démarrage de la sandbox pour la session ${sessionId}`);
@@ -383,8 +646,8 @@ wss.on('connection', (ws) => {
 
                     // Démarrer le script
                     console.log(`\n▶️ Exécution du script pour la session ${sessionId}`);
-                    sandbox.runScript(message.config.scriptPath).then(process => {
-                        console.log(`\n[DEBUG] Processus démarré. PID: ${process.pid}`);
+                    sandbox.runScript(message.config.scriptPath).then(processController => {
+                        console.log(`\n[DEBUG] Processus démarré. PID: ${processController.process.pid}`);
                         
                         // Stocker la sandbox immédiatement
                         const session = sessions.get(sessionId);
@@ -397,7 +660,7 @@ wss.on('connection', (ws) => {
                         // Créer l'objet sandbox
                         const sandboxInfo = {
                             sandbox,
-                            process,
+                            process: processController.process,
                             scriptPath: message.config.scriptPath,
                             env: message.config.env || {},
                             isRunning: true
@@ -417,6 +680,36 @@ wss.on('connection', (ws) => {
                         console.log(`[DEBUG] État final des sandboxes:`, Array.from(session.sandboxes.keys()));
 
                         console.log(`\n✅ Script démarré pour la session ${sessionId}`);
+
+                        // Instruct the sandbox child process to initialize its real bridge client
+                        if (processController && processController.process && typeof processController.process.send === 'function') {
+                            const targetFlutterBridgeId = message.config.targetFlutterBridgeId; 
+                            if (!targetFlutterBridgeId) {
+                                console.error(`[MAIN] Error starting sandbox for session ${sessionId}: 'targetFlutterBridgeId' missing in start message config.`);
+                                ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: "'targetFlutterBridgeId' is required in start config." }));
+                                // Consider stopping the sandbox here
+                                return; 
+                            }
+
+                            if (connectedBridges.has(targetFlutterBridgeId)) {
+                                console.log(`[MAIN] Instructing sandbox child process (PID: ${processController.process.pid}) to initialize its Bridge client. Target Flutter Bridge ID: ${targetFlutterBridgeId}, Sandbox Session (Client) ID: ${sessionId}, Actual Sandbox ID: ${message.sandboxId}`);
+                                processController.process.send({
+                                    type: 'bridge_register',                // Tells sandbox.js to init its Bridge instance
+                                    targetFlutterBridgeId: targetFlutterBridgeId, // The ID of the Flutter Bridge Portal to use (renamed from bridgeId for clarity)
+                                    sandboxSessionId: sessionId,             // The mcp_client session ID (main.js context)
+                                    actualSandboxId: message.sandboxId     // The unique ID for this sandbox instance, from mcp_client
+                                });
+                            } else {
+                                console.error(`[MAIN] Cannot instruct sandbox for session ${sessionId} to register bridge: Target Flutter Bridge '${targetFlutterBridgeId}' is not connected.`);
+                                ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: `Target Flutter Bridge '${targetFlutterBridgeId}' not connected.` }));
+                                // Optionally, stop the sandbox, as it won't have a functional bridge.
+                                // sandboxInfo.process.stop(); or similar cleanup
+                            }
+                        } else {
+                             console.error(`[MAIN] Sandbox process for session ${sessionId} not available or no send method, cannot send bridge_register instruction.`);
+                             ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: "Sandbox process communication channel not available." }));
+                        }
+
                         ws.send(JSON.stringify({
                             type: 'sandbox_updated',
                             connectionId: sessionId,
@@ -503,6 +796,8 @@ wss.on('connection', (ws) => {
                         console.log(`[DEBUG] Sandboxes disponibles:`, Array.from(currentSession.sandboxes.keys()));
                     }
                     broadcastConnections();
+                    // Add this line before or after removing the sandbox from the session
+                    sandboxBridgeAssignments.delete(message.sandboxId);
                     break;
 
                 case 'command':
@@ -582,7 +877,10 @@ wss.on('connection', (ws) => {
                             ? JSON.parse(message.command)
                             : message.command;
 
-                        console.log('\n[DEBUG] Envoi de la commande JSON-RPC:', JSON.stringify(jsonRpcRequest, null, 2));
+                        // Important flow log - always show regardless of DEBUG setting
+                        console.log(`\n🔄 [FLOW] JSON-RPC command ${jsonRpcRequest.method} (id: ${jsonRpcRequest.id}) for sandbox ${message.sandboxId} (session ${sessionId})`);
+                        
+                        debugLog('\n[DEBUG] Envoi de la commande JSON-RPC:', JSON.stringify(jsonRpcRequest, null, 2));
                         
                         // Send the parsed JSON-RPC request directly
                         sandboxInfo.process.stdin.write(JSON.stringify(jsonRpcRequest) + '\n');
@@ -594,7 +892,7 @@ wss.on('connection', (ws) => {
                             command: jsonRpcRequest
                         }));
                     } catch (error) {
-                        console.error('\n[DEBUG] Erreur lors du parsing de la commande:', error);
+                        console.error('\n❌ [ERROR] Command parsing failed:', error.message);
                         ws.send(JSON.stringify({
                             type: 'error',
                             error: 'Format de commande invalide',
@@ -608,43 +906,58 @@ wss.on('connection', (ws) => {
                     }
                     break;
 
-                case 'stdout':
-                case 'stderr':
-                    const sandboxId = message['sandboxId'];
-                    const messageContent = message['message'];
-                    const isJson = message['isJson'] || false;
-                    
-                    // Transmettre le message au client
-                    if (sessions.get(sessionId).ws && sessions.get(sessionId).ws.readyState === 1) {
-                        sessions.get(sessionId).ws.send(JSON.stringify({
-                            type: message.type,
-                            connectionId: sessionId,
-                            sandboxId: sandboxId,
-                            message: messageContent,
-                            isJson: isJson
-                        }));
+                // stdout/stderr from a Sandbox Bridge Client (wrapper/bridge.js instance)
+                case 'stdout': // Note: type 'stdout' might also be used by mcp_client for other things.
+                case 'stderr': // We rely on ws.isSandboxBridgeClient to differentiate.
+                    if (ws.isSandboxBridgeClient) {
+                        const actualSandboxId = message.actualSandboxId;
+                        const sandboxSessionId = message.sandboxSessionId; // This is the mcp_client's session ID
+                        const outputMessage = message.message;
+                        const messageType = message.type; // 'stdout' or 'stderr'
 
-                        // Si c'est une réponse JSON, mettre à jour l'état de la sandbox
-                        if (isJson) {
-                            try {
-                                const jsonResponse = JSON.parse(messageContent);
-                                const sandbox = sessions.get(sessionId).sandboxes.find(
-                                    (s) => s.id === sandboxId
-                                );
-                                if (sandbox) {
-                                    sandbox.lastResponse = jsonResponse;
-                                    // Notifier le client de la mise à jour
-                                    sessions.get(sessionId).ws.send(JSON.stringify({
-                                        type: 'sandbox_response_updated',
-                                        connectionId: sessionId,
-                                        sandboxId: sandboxId,
-                                        response: jsonResponse
-                                    }));
-                                }
-                            } catch (e) {
-                                console.error('Erreur lors du parsing de la réponse JSON:', e);
-                            }
+                        if (!actualSandboxId || !sandboxSessionId || outputMessage === undefined) {
+                            console.warn(`[MAIN] Malformed ${messageType} from sandbox bridge client:`, message);
+                            // Optionally send an error back to the sandbox bridge client if it had a requestId
+                            break;
                         }
+
+                        const clientSession = sessions.get(sandboxSessionId);
+                        if (clientSession && clientSession.ws && clientSession.ws.readyState === 1) {
+                            // Important flow log for command responses
+                            if (message.isJson) {
+                                try {
+                                    const jsonOutput = JSON.parse(outputMessage);
+                                    if (jsonOutput.id && jsonOutput.result && jsonOutput.jsonrpc === "2.0") {
+                                        console.log(`\n✅ [FLOW] JSON-RPC response (id: ${jsonOutput.id}) from sandbox ${actualSandboxId}`);
+                                    }
+                                } catch (e) {
+                                    // Not valid JSON or not a JSON-RPC response
+                                }
+                            }
+                            
+                            debugLog(`\n📠 Forwarding ${messageType} from sandbox ${actualSandboxId} (session ${sandboxSessionId}) to MCP Client:`, 
+                                outputMessage.substring(0, 100) + (outputMessage.length > 100 ? '...' : ''));
+                            
+                            clientSession.ws.send(JSON.stringify({
+                                type: messageType,
+                                connectionId: sandboxSessionId,
+                                sandboxId: actualSandboxId,
+                                message: outputMessage,
+                                isJson: message.isJson || false
+                            }));
+                        } else {
+                            debugLog(`\n[DEBUG] MCP Client session ${sandboxSessionId} not found or not connected for forwarding ${messageType} from sandbox ${actualSandboxId}.`);
+                        }
+                    } else {
+                        // This stdout/stderr is NOT from a sandbox_bridge_client.
+                        // It might be from mcp_client if it ever sends such types, or an old handler.
+                        // For now, let it fall through to default or a pre-existing general handler if any.
+                        // Based on current structure, it would hit the default error.
+                        // This section might need to be merged with the general stdout/stderr handler later if one exists and is intended.
+                        console.log(`\n⚠️ Received ${message.type} from non-SandboxBridgeClient (session ${sessionId}). Message:`, message);
+                        // Let it fall to default for now, which throws an error.
+                        // This helps identify if any other component is unexpectedly sending these types.
+                        throw new Error(`Unhandled ${message.type} from non-SandboxBridgeClient.`);
                     }
                     break;
 
@@ -653,13 +966,74 @@ wss.on('connection', (ws) => {
                         bridgeId,
                         platform: info.platform,
                         connectedAt: info.connectedAt,
-                        status: 'connected'
+                        status: 'connected',
+                        capabilities: info.capabilities // Also include capabilities if available
                     }));
 
                     ws.send(JSON.stringify({
                         type: 'bridge_status_update',
                         bridges: bridgeStatus
                     }));
+                    break;
+                }
+
+                case 'get_connected_sandboxes': {
+                    const requestedBridgeId = message.bridgeId;
+                    if (!requestedBridgeId) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            error: 'Missing bridgeId parameter'
+                        }));
+                        break;
+                    }
+                    
+                    // Find all sandboxes assigned to this bridge
+                    const connectedSandboxes = [];
+                    
+                    // Always log this without DEBUG check - important for troubleshooting
+                    console.log(`[MAIN] Getting connected sandboxes for bridge ID: ${requestedBridgeId}`);
+                    console.log(`[MAIN] Current assignments:`, Array.from(sandboxBridgeAssignments.entries()));
+                    
+                    // Collect all sandboxes from all sessions
+                    sessions.forEach((sessionInfo, sessionId) => {
+                        sessionInfo.sandboxes.forEach((sandboxInfo, sandboxId) => {
+                            const assignedBridgeId = sandboxBridgeAssignments.get(sandboxId);
+                            
+                            // Check if this sandbox is assigned to the requested bridge
+                            if (assignedBridgeId === requestedBridgeId) {
+                                connectedSandboxes.push({
+                                    id: sandboxId,
+                                    scriptPath: sandboxInfo.scriptPath || 'Unknown script',
+                                    sessionId: sessionId,
+                                    status: 'connected',
+                                    bridgeId: assignedBridgeId
+                                });
+                            }
+                        });
+                    });
+                    
+                    // Send the response with full details of the connected sandboxes
+                    console.log(`[MAIN] Sending connected sandboxes update to bridge ${requestedBridgeId} with ${connectedSandboxes.length} sandboxes: `, connectedSandboxes.length > 0 ? JSON.stringify(connectedSandboxes) : "[]");
+                    ws.send(JSON.stringify({
+                        type: 'connected_sandboxes_update',
+                        sandboxes: connectedSandboxes
+                    }));
+                    
+                    // Also notify this specific bridge about sandbox assignments
+                    const bridgeSpecificAssignments = {};
+                    sandboxBridgeAssignments.forEach((bridgeId, sandboxId) => {
+                        if (bridgeId === requestedBridgeId) {
+                            bridgeSpecificAssignments[sandboxId] = bridgeId;
+                        }
+                    });
+                    
+                    // Send a direct bridge_assignments_update to this bridge
+                    console.log(`[MAIN] Also sending direct bridge assignments to ${requestedBridgeId}:`, bridgeSpecificAssignments);
+                    ws.send(JSON.stringify({
+                        type: 'bridge_assignments_update',
+                        assignments: bridgeSpecificAssignments
+                    }));
+                    
                     break;
                 }
 
@@ -680,22 +1054,36 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log(`\n🔌 Déconnexion WebSocket (session ${sessionId})`);
         
-        // Check if this was a bridge connection
-        for (const [bridgeId, info] of connectedBridges.entries()) {
-            if (info.ws === ws) {
-                console.log(`\n🔌 Bridge ${bridgeId} disconnected`);
-                connectedBridges.delete(bridgeId);
+        // Check if this was a Flutter bridge connection
+        if (ws.isFlutterBridge && ws.bridgeId) {
+            if (connectedBridges.has(ws.bridgeId)) {
+                console.log(`\n🔌 Flutter Bridge Portal ${ws.bridgeId} disconnected`);
+                connectedBridges.delete(ws.bridgeId);
                 broadcastBridgeStatus();
-                break;
+            }
+        } else if (ws.isSandboxBridgeClient && ws.bridgeClientInstanceId) {
+            console.log(`\n🔌 Sandbox Bridge Client ${ws.bridgeClientInstanceId} (targeting ${ws.targetFlutterBridgeId}) disconnected.`);
+            // Clean up pending requests that were expecting a response via this client, if any
+            // (though responses go via Flutter bridge connection, not this one directly typically)
+            // No specific cleanup needed here for pendingSandboxRequests as they are keyed by requests *to* Flutter.
+        } else {
+            // This was a client (e.g. mcp_client) connection
+            if (sessions.has(sessionId)) {
+                 console.log(`\n🔌 MCP Client ${sessionId} disconnected.`);
+                 stopSandbox(sessionId); // Stop all sandboxes for this client session
+                 sessions.delete(sessionId);
+                 broadcastConnections(); // Update other clients about the disconnection
             }
         }
         
-        stopSandbox(sessionId);
+        // Original logic for stopping sandboxes if client disconnects (covers mcp_client)
+        // The new logic above handles specific bridge types first.
+        // If it was an MCP client, the 'else' block for sessions.has(sessionId) now handles it.
+        // The old call to stopSandbox(sessionId) here is now conditional.
     });
 });
 
 // Démarrer le serveur
-const PORT = 3000;
 server.listen(PORT, () => {
     console.log(`\n🚀 Bridge démarré sur le port ${PORT}`);
     console.log(`📊 Sessions actives: ${sessions.size}`);
