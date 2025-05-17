@@ -16,7 +16,8 @@ let modules = {
   net: null,
   dns: null,
   childProcess: null,
-  WebSocket: null
+  WebSocket: null,
+  stream: null
 };
 
 // Create proxies for each module
@@ -58,6 +59,9 @@ async function loadModules() {
       // WebSocket module might not be available
       console.warn('WebSocket module not available:', e.message);
     }
+    
+    const streamModule = await import('stream');
+    modules.stream = streamModule.default || streamModule;
     
     return true;
   } catch (e) {
@@ -176,7 +180,7 @@ export class NodeInterceptor extends InterceptorInterface {
     // Handle ESM mode differently - we need to proxy the modules
     if (this.isESM) {
       // Double-check that modules are available or retry loading them
-      if (!modules.fs || !modules.http) {
+      if (!modules.fs || !modules.http || !modules.stream) {
         this._debug('Modules not loaded properly, retrying load');
         await loadModules();
       }
@@ -1624,207 +1628,85 @@ export class NodeInterceptor extends InterceptorInterface {
   static instance = null;
 
   /**
-   * Helper to handle HTTP/HTTPS requests
+   * Centralized handler for HTTP/HTTPS requests after interception.
+   * This method sends the request details to the bridge and simulates
+   * a Node.js IncomingMessage stream with the bridge's response.
+   * 
+   * @param {string} type - 'http_request' or 'https_request'
+   * @param {string} urlString - The full URL
+   * @param {object} options - Original request options
+   * @param {string|Buffer|null} requestBody - The body of the outgoing request
+   * @returns {Promise<{response: Readable, rawBridgeResponse: object}>} Resolves with a mock IncomingMessage and raw bridge data.
    * @private
    */
-  _handleHttpRequest(type, url, options, callback) {
-    // Normalize arguments
-    if (typeof options === 'function') {
-      callback = options;
-      options = {};
+  async _handleHttpRequest(type, urlString, options, requestBody = null) {
+    const bridge = this.getBridge();
+    if (!bridge) {
+      this._debug('Bridge not available for HTTP request');
+      return Promise.reject(new Error('Bridge not available'));
     }
-    
-    const urlString = typeof url === 'string' ? url : url.href;
-    this._debug(`Intercepted ${type} request to ${urlString}`);
-    
-    // Create a fake request object that emulates the http.ClientRequest
-    const fakeReq = {
-      _events: {},
-      _eventsCount: 0,
-      _maxListeners: undefined,
-      
-      // Methods
-      on: (event, listener) => {
-        if (!fakeReq._events[event]) {
-          fakeReq._events[event] = [];
-        }
-        fakeReq._events[event].push(listener);
-        fakeReq._eventsCount++;
-        return fakeReq;
-      },
-      
-      once: (event, listener) => {
-        const onceListener = (...args) => {
-          fakeReq.removeListener(event, onceListener);
-          listener(...args);
-        };
-        return fakeReq.on(event, onceListener);
-      },
-      
-      removeListener: (event, listener) => {
-        if (fakeReq._events[event]) {
-          fakeReq._events[event] = fakeReq._events[event].filter(l => l !== listener);
-          fakeReq._eventsCount--;
-        }
-        return fakeReq;
-      },
-      
-      end: (data) => {
-        // Create a fake ClientResponse object
-        const fakeRes = {
-          httpVersion: '1.1',
-          statusCode: 200,
-          statusMessage: 'OK',
-          headers: {},
-          rawHeaders: [],
-          trailers: {},
-          rawTrailers: [],
-          on: (event, listener) => {
-            if (event === 'data' || event === 'end') {
-              // We'll call these manually
-              fakeRes[`_${event}Listener`] = listener;
-            }
-            return fakeRes;
-          }
-        };
-        
-        // Intercept the request
-        this.sendIntercept(type, {
-          url: urlString,
-          options,
-          body: data
-        }).then(response => {
-          try {
-            // Set the status code, headers and body
-            fakeRes.statusCode = response.statusCode || 200;
-            fakeRes.statusMessage = response.statusMessage || (fakeRes.statusCode === 200 ? 'OK' : 'Error');
-            
-            // Convert headers to Node.js format (all lowercase)
-            const headers = response.headers || {};
-            fakeRes.headers = Object.keys(headers).reduce((acc, key) => {
-              acc[key.toLowerCase()] = headers[key];
-              return acc;
-            }, {});
-            
-            // If headers don't specify content-type, add a default
-            if (!fakeRes.headers['content-type']) {
-              if (typeof response.body === 'object' || (response.body && (response.body.startsWith('{') || response.body.startsWith('[')))) {
-                fakeRes.headers['content-type'] = 'application/json';
-              } else {
-                fakeRes.headers['content-type'] = 'text/plain';
-              }
-            }
-            
-            // Convert raw headers for Node's http module
-            fakeRes.rawHeaders = [];
-            Object.keys(fakeRes.headers).forEach(key => {
-              fakeRes.rawHeaders.push(key);
-              fakeRes.rawHeaders.push(fakeRes.headers[key]);
-            });
-            
-            // Create the response body
-            let responseBody = '';
-            if (response.body) {
-              responseBody = typeof response.body === 'object' ? 
-                JSON.stringify(response.body) : 
-                response.body;
-            }
-            
-            // Emit the response to listeners
-            if (callback) {
-              callback(fakeRes);
-            }
-            
-            // Emit the response event on the request
-            if (fakeReq._events.response) {
-              fakeReq._events.response.forEach(listener => {
-                try {
-                  listener(fakeRes);
-                } catch (err) {
-                  this._debug(`Error in response listener: ${err.message}`);
-                }
-              });
-            }
-            
-            // Emit the response data
-            if (fakeRes._dataListener && responseBody) {
-              try {
-                fakeRes._dataListener(Buffer.from(responseBody));
-              } catch (err) {
-                this._debug(`Error in data listener: ${err.message}`);
-              }
-            }
-            
-            // Emit the end event
-            if (fakeRes._endListener) {
-              try {
-                fakeRes._endListener();
-              } catch (err) {
-                this._debug(`Error in end listener: ${err.message}`);
-              }
-            }
-          } catch (error) {
-            this._debug(`Error processing HTTP response: ${error.message}`);
-            this._handleError(fakeReq, error);
-          }
-        }).catch(error => {
-          this._debug(`Error in HTTP request: ${error.message}`);
-          this._handleError(fakeReq, error);
-        });
-        
-        return fakeReq;
-      },
-      
-      write: (data) => {
-        // Store data for end()
-        fakeReq._data = data;
-        return true;
-      },
-      
-      abort: () => {
-        // Handle aborted requests
-        if (fakeReq._events.abort) {
-          fakeReq._events.abort.forEach(listener => listener());
-        }
-      },
-      
-      setTimeout: (timeout, callback) => {
-        // Ignore timeout for now
-        if (callback) {
-          callback();
-        }
-        return fakeReq;
-      },
-      
-      setNoDelay: () => fakeReq,
-      setSocketKeepAlive: () => fakeReq,
-      setHeader: (name, value) => {
-        if (!options.headers) {
-          options.headers = {};
-        }
-        options.headers[name] = value;
-        return fakeReq;
-      },
-      getHeader: (name) => {
-        return options.headers ? options.headers[name] : undefined;
-      },
-      removeHeader: (name) => {
-        if (options.headers) {
-          delete options.headers[name];
-        }
-        return fakeReq;
-      }
+
+    // Prepare payload for the bridge
+    const payload = {
+      url: urlString,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      body: requestBody ? (Buffer.isBuffer(requestBody) ? requestBody.toString('base64') : requestBody) : null,
+      // Indicate if the body sent to bridge is base64 (for bridge to know)
+      isRequestBodyBase64: Buffer.isBuffer(requestBody)
     };
-    
-    // For GET requests, automatically call end() to start the request
-    // This is important for http.get() to work properly
-    if ((!options.method || options.method === 'GET') && type.includes('http')) {
-      process.nextTick(() => {
-        fakeReq.end();
+
+    this._debug(`Sending ${type} to bridge:`, payload.method, payload.url);
+
+    return this.sendIntercept(type, payload)
+      .then(async bridgeResponse => {
+        this._debug(`Bridge response for ${type} ${payload.url}:`, bridgeResponse.statusCode, bridgeResponse.headers);
+
+        const PassThrough = modules.stream.PassThrough;
+        const responseStream = new PassThrough();
+
+        if (bridgeResponse.body !== undefined && bridgeResponse.body !== null) {
+          let bodyData = bridgeResponse.body;
+          // Check if the bridge indicates the response body is base64 encoded
+          if (bridgeResponse.headers && (bridgeResponse.headers['content-encoding'] === 'base64' || bridgeResponse.isResponseBodyBase64)) {
+            this._debug('Decoding base64 response body from bridge');
+            bodyData = Buffer.from(bodyData, 'base64');
+          } else if (typeof bodyData === 'object') {
+            // If the bridge sent a parsed JSON object (not ideal, string is better), stringify it.
+            this._debug('Stringifying JSON object response body from bridge');
+            bodyData = JSON.stringify(bodyData);
+          } else if (typeof bodyData !== 'string' && !Buffer.isBuffer(bodyData)) {
+            this._debug('Converting non-string/buffer response body to string');
+            bodyData = String(bodyData); // Ensure it's a string or buffer for push
+          }
+          responseStream.push(bodyData);
+        }
+        responseStream.push(null); // End the stream
+
+        // Attach properties to the stream to make it look like an IncomingMessage
+        responseStream.statusCode = parseInt(bridgeResponse.statusCode, 10) || 500;
+        responseStream.headers = bridgeResponse.headers || {};
+        responseStream.httpVersion = bridgeResponse.httpVersion || '1.1';
+        // Use STATUS_CODES from the http module, ensure http module is loaded
+        const httpModule = modules.http || (this.isESM ? (await import('http')).default : require('http'));
+        responseStream.statusMessage = bridgeResponse.statusMessage || httpModule.STATUS_CODES[responseStream.statusCode] || '';
+
+        // Make it more like an IncomingMessage for event listeners
+        responseStream.socket = null; // Mock socket
+        responseStream.connection = null; // Mock connection
+        responseStream.method = payload.method; // For context, though not on IncomingMessage
+        responseStream.url = payload.url; // For context
+
+        return {
+          response: responseStream, // This is the IncomingMessage-like stream
+          rawBridgeResponse: bridgeResponse // Original data from bridge for debugging or other uses
+        };
+      })
+      .catch(error => {
+        this._debug(`Error in _handleHttpRequest for ${type} ${payload.url}:`, error);
+        // Ensure the error is re-thrown so the caller (e.g., proxiedRequest) can emit it.
+        throw error;
       });
-    }
-    
-    return fakeReq;
   }
 }
 

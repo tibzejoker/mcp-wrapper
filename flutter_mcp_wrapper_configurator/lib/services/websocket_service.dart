@@ -19,12 +19,12 @@ class Sandbox {
   });
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'scriptPath': scriptPath,
-    'env': env,
-    'isRunning': isRunning,
-    'lastResponse': lastResponse,
-  };
+        'id': id,
+        'scriptPath': scriptPath,
+        'env': env,
+        'isRunning': isRunning,
+        'lastResponse': lastResponse,
+      };
 }
 
 class WebSocketConnection {
@@ -45,8 +45,8 @@ class WebSocketConnection {
     required this.onMessage,
     required this.onError,
     required this.onStdout,
-  }) : isConnected = false,
-       sandboxes = [];
+  })  : isConnected = false,
+        sandboxes = [];
 
   void connect() {
     try {
@@ -55,7 +55,7 @@ class WebSocketConnection {
         (message) {
           print('Message reçu: $message');
           final data = jsonDecode(message);
-          switch(data['type']) {
+          switch (data['type']) {
             case 'bridge_validation_update':
               print('Bridge validation update received');
               final validIds = List<String>.from(data['validBridgeIds']);
@@ -105,7 +105,7 @@ class WebSocketConnection {
               final sandboxId = data['sandboxId'];
               final outputMessage = data['message'];
               final isJson = data['isJson'] ?? false;
-              
+
               // Update the sandbox's last response if it's JSON
               if (isJson) {
                 try {
@@ -124,7 +124,7 @@ class WebSocketConnection {
                   print('Error parsing JSON response: $e');
                 }
               }
-              
+
               // Forward the message to update UI
               onMessage(message);
               break;
@@ -164,7 +164,8 @@ class WebSocketConnection {
     isConnected = false;
   }
 
-  void startSandbox(String scriptPath, Map<String, String> env) {
+  void startSandbox(String scriptPath, Map<String, String> env,
+      {String? targetFlutterBridgeId}) {
     if (!isConnected) {
       onError('Not connected to server');
       return;
@@ -186,9 +187,13 @@ class WebSocketConnection {
       'config': {
         'scriptPath': scriptPath,
         'env': env,
+        if (targetFlutterBridgeId != null)
+          'targetFlutterBridgeId': targetFlutterBridgeId,
       }
     };
 
+    print(
+        'Sending start message with config: ${jsonEncode(message['config'])}');
     channel!.sink.add(jsonEncode(message));
   }
 
@@ -266,7 +271,8 @@ class WebSocketConnection {
     void messageHandler(dynamic message) {
       try {
         final data = jsonDecode(message);
-        if (data['type'] == 'bridge_id_generated' && data['requestId'] == requestId) {
+        if (data['type'] == 'bridge_id_generated' &&
+            data['requestId'] == requestId) {
           completer.complete({
             'bridgeId': data['bridgeId'],
             'expiresAt': data['expiresAt'],
@@ -328,4 +334,4 @@ class WebSocketService {
   List<WebSocketConnection> get connections => _connections.values.toList();
 
   WebSocketConnection? getConnection(String id) => _connections[id];
-} 
+}

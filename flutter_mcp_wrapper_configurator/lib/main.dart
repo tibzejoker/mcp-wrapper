@@ -5,6 +5,7 @@ import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/websocket_service.dart';
 import 'services/script_service.dart';
+import 'dart:math';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -59,6 +60,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
   String? _currentConnectionId;
   Map<String, dynamic> _connectionInfo = {};
   List<Map<String, dynamic>> _connections = [];
+  List<Map<String, dynamic>> _connectedBridges = [];
+  Map<String, String> _bridgeAssignments = {}; // Map of sandboxId -> bridgeId
   bool _isConnected = false;
   String _sandboxFilter = 'running'; // 'all', 'running', 'stopped'
   String? _selectedSandboxId;
@@ -167,6 +170,26 @@ class _MCPClientPageState extends State<MCPClientPage> {
 
         case 'bridge_registered':
           print('Bridge registered: ${data['bridgeId']}');
+          break;
+
+        case 'bridge_status_update':
+          print('Bridge status update received');
+          if (data['bridges'] != null) {
+            setState(() {
+              _connectedBridges =
+                  List<Map<String, dynamic>>.from(data['bridges']);
+            });
+          }
+          break;
+
+        case 'bridge_assignments_update':
+          print('Bridge assignments update received');
+          if (data['assignments'] != null) {
+            setState(() {
+              _bridgeAssignments =
+                  Map<String, String>.from(data['assignments']);
+            });
+          }
           break;
       }
 
@@ -290,23 +313,43 @@ class _MCPClientPageState extends State<MCPClientPage> {
   }
 
   void _startSandbox() {
-    if (_currentConnectionId != null && _selectedScript != null) {
-      final connection = _wsService.getConnection(_currentConnectionId!);
-      if (connection != null) {
-        final Map<String, String> env = _selectedEnvironment != null
-            ? Map<String, String>.from(
-                _savedEnvironments[_selectedEnvironment]!)
-            : <String, String>{};
-        connection.startSandbox(_selectedScript!, env);
-        setState(() {
-          _connectionInfo[_currentConnectionId!] = {
-            'url': connection.url,
-            'status': connection.isConnected ? 'connected' : 'disconnected',
-            'sandboxes': connection.sandboxes.map((s) => s.toJson()).toList(),
-          };
-        });
-      }
+    if (_selectedScript == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select a script')),
+      );
+      return;
     }
+
+    final env = _selectedEnvironment != null
+        ? Map<String, String>.from(
+            _savedEnvironments[_selectedEnvironment!] ?? {})
+        : <String, String>{};
+
+    // Get the connection
+    final connection = _wsService.getConnection(_currentConnectionId!);
+    if (connection == null) {
+      _appendToOutput('❌ No active connection to start sandbox');
+      return;
+    }
+
+    // Only add targetFlutterBridgeId if a bridge is selected
+    final selectedBridgeId = _getSelectedBridgeId();
+
+    // Call startSandbox with the correct parameters (scriptPath, env, targetFlutterBridgeId)
+    connection.startSandbox(
+      _selectedScript!,
+      env,
+      targetFlutterBridgeId: selectedBridgeId,
+    );
+
+    _appendToOutput('▶️ Starting sandbox with script: $_selectedScript');
+  }
+
+  // Helper to get the currently selected bridge ID (if any)
+  String? _getSelectedBridgeId() {
+    // Return the currently selected bridge ID (if implemented with a dropdown)
+    // For now, we'll just return null to let the server auto-assign
+    return null;
   }
 
   void _stopSandbox(String sandboxId) {
@@ -968,91 +1011,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
                         const Text('Sandboxes:',
                             style: TextStyle(fontWeight: FontWeight.bold)),
                         ...filteredSandboxes.map((sandbox) {
-                          return Card(
-                            margin: const EdgeInsets.only(top: 4),
-                            color: _selectedSandboxId == sandbox.id
-                                ? Colors.blue.withOpacity(0.1)
-                                : null,
-                            child: InkWell(
-                              onTap: () {
-                                _selectSandbox(sandbox.id);
-                              },
-                              child: Padding(
-                                padding: const EdgeInsets.all(8.0),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Row(
-                                      children: [
-                                        Icon(
-                                          sandbox.isRunning
-                                              ? Icons.play_circle
-                                              : Icons.stop_circle,
-                                          color: sandbox.isRunning
-                                              ? Colors.green
-                                              : Colors.red,
-                                          size: 16,
-                                        ),
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                'Script: ${sandbox.scriptPath}',
-                                                style: const TextStyle(
-                                                    fontWeight:
-                                                        FontWeight.bold),
-                                              ),
-                                              if (sandbox.env.isNotEmpty) ...[
-                                                const SizedBox(height: 4),
-                                                Text(
-                                                  'Variables d\'environnement:',
-                                                  style: TextStyle(
-                                                    fontSize: 12,
-                                                    color: Colors.grey[600],
-                                                  ),
-                                                ),
-                                                ...sandbox.env.entries
-                                                    .map((env) {
-                                                  return Padding(
-                                                    padding:
-                                                        const EdgeInsets.only(
-                                                            left: 8.0),
-                                                    child: Text(
-                                                      '${env.key}: ${env.value}',
-                                                      style: const TextStyle(
-                                                          fontSize: 12),
-                                                    ),
-                                                  );
-                                                }),
-                                              ],
-                                            ],
-                                          ),
-                                        ),
-                                        if (_selectedSandboxId == sandbox.id)
-                                          const Padding(
-                                            padding:
-                                                EdgeInsets.only(right: 8.0),
-                                            child: Icon(Icons.check_circle,
-                                                color: Colors.blue, size: 16),
-                                          ),
-                                        if (sandbox.isRunning)
-                                          IconButton(
-                                            icon: const Icon(Icons.stop,
-                                                size: 16),
-                                            onPressed: () =>
-                                                _stopSandbox(sandbox.id),
-                                            tooltip: 'Arrêter la sandbox',
-                                          ),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
+                          return _buildSandboxCard(sandbox);
                         }).toList(),
                       ],
                     ],
@@ -1205,6 +1164,105 @@ class _MCPClientPageState extends State<MCPClientPage> {
     } else {
       return '${seconds}s';
     }
+  }
+
+  // Add this helper to get bridge name for a sandbox
+  String _getBridgeNameForSandbox(String sandboxId) {
+    final bridgeId = _bridgeAssignments[sandboxId];
+    if (bridgeId == null) {
+      return 'Not assigned';
+    }
+
+    // Look up the bridge details
+    final bridge = _connectedBridges.firstWhere(
+        (b) => b['bridgeId'] == bridgeId,
+        orElse: () => {'bridgeId': bridgeId, 'platform': 'unknown'});
+
+    return '${bridge['platform']} (${bridge['bridgeId']})';
+  }
+
+  // Modify the sandbox display to show bridge assignments
+  Widget _buildSandboxCard(Sandbox sandbox) {
+    final sandboxId = sandbox.id;
+    final isRunning = sandbox.isRunning;
+    final scriptPath = sandbox.scriptPath;
+    final bridgeInfo = _getBridgeNameForSandbox(sandboxId);
+
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Sandbox: $sandboxId',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color:
+                        isRunning ? Colors.green.shade100 : Colors.red.shade100,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    isRunning ? 'Running' : 'Stopped',
+                    style: TextStyle(
+                      color: isRunning
+                          ? Colors.green.shade800
+                          : Colors.red.shade800,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text('Script: $scriptPath'),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                const Icon(Icons.link, size: 16),
+                const SizedBox(width: 4),
+                Text('Bridge: $bridgeInfo'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (isRunning)
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.stop, size: 16),
+                    label: const Text('Stop'),
+                    onPressed: () => _stopSandbox(sandboxId),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                const SizedBox(width: 8),
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.terminal, size: 16),
+                  label: const Text('Send Command'),
+                  onPressed: () => _selectSandbox(sandboxId),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue,
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+              ],
+            )
+          ],
+        ),
+      ),
+    );
   }
 }
 
