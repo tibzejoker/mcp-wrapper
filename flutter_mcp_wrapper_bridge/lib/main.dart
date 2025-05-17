@@ -35,7 +35,7 @@ class BridgePortalPage extends StatefulWidget {
 
 class _BridgePortalPageState extends State<BridgePortalPage> {
   final _serverUrlController =
-      TextEditingController(text: 'ws://localhost:3000');
+      TextEditingController(text: 'ws://192.168.1.27:3000');
   final _bridgeIdController = TextEditingController();
   final _outputController = TextEditingController();
   final _testParamsController = TextEditingController();

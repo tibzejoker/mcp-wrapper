@@ -22,8 +22,15 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MCP Client',
+      themeMode: ThemeMode.dark,
       theme: ThemeData(
-        primarySwatch: Colors.blue,
+        brightness: Brightness.dark,
+        primaryColor: Colors.black,
+        scaffoldBackgroundColor: Colors.grey[900],
+        colorScheme: const ColorScheme.dark(
+          primary: Colors.blueGrey,
+          secondary: Colors.teal,
+        ),
         useMaterial3: true,
       ),
       debugShowCheckedModeBanner: false,
@@ -579,13 +586,18 @@ class _MCPClientPageState extends State<MCPClientPage> {
               _buildSandboxControls(),
               const SizedBox(height: 16),
 
-              // Command input
-              Row(
-                children: [
-                  Expanded(
+              // Command input - make responsive
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  // Determine if we should use a row or column layout based on width
+                  bool useRowLayout = constraints.maxWidth > 700;
+
+                  // Common widgets used in both layouts
+                  final methodDropdown = Expanded(
                     flex: 2,
                     child: DropdownButtonFormField<String>(
                       value: _selectedMethod,
+                      isExpanded: true,
                       decoration: const InputDecoration(
                         labelText: 'Method',
                         border: OutlineInputBorder(),
@@ -606,25 +618,25 @@ class _MCPClientPageState extends State<MCPClientPage> {
                         }
                       },
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  if (_selectedMethod == 'tools/call') ...[
-                    Expanded(
-                      flex: 2,
-                      child: TextField(
-                        controller: _toolNameController,
-                        decoration: const InputDecoration(
-                          labelText: 'Tool Name',
-                          border: OutlineInputBorder(),
-                          hintText: 'execute_jql',
-                        ),
-                        enabled: _currentConnectionId != null &&
-                            _selectedSandboxId != null,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                  ],
-                  Expanded(
+                  );
+
+                  final toolNameField = _selectedMethod == 'tools/call'
+                      ? Expanded(
+                          flex: 2,
+                          child: TextField(
+                            controller: _toolNameController,
+                            decoration: const InputDecoration(
+                              labelText: 'Tool Name',
+                              border: OutlineInputBorder(),
+                              hintText: 'execute_jql',
+                            ),
+                            enabled: _currentConnectionId != null &&
+                                _selectedSandboxId != null,
+                          ),
+                        )
+                      : const SizedBox.shrink();
+
+                  final paramsField = Expanded(
                     flex: 3,
                     child: TextField(
                       controller: _paramsController,
@@ -640,16 +652,50 @@ class _MCPClientPageState extends State<MCPClientPage> {
                       enabled: _currentConnectionId != null &&
                           _selectedSandboxId != null,
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton(
+                  );
+
+                  final sendButton = ElevatedButton(
                     onPressed: _currentConnectionId != null &&
                             _selectedSandboxId != null
                         ? () => _sendCommand()
                         : null,
                     child: const Text('Send'),
-                  ),
-                ],
+                  );
+
+                  // Return row or column layout based on available width
+                  if (useRowLayout) {
+                    // Wide layout (row)
+                    return Row(
+                      children: [
+                        methodDropdown,
+                        const SizedBox(width: 8),
+                        if (_selectedMethod == 'tools/call') ...[
+                          toolNameField,
+                          const SizedBox(width: 8),
+                        ],
+                        paramsField,
+                        const SizedBox(width: 8),
+                        sendButton,
+                      ],
+                    );
+                  } else {
+                    // Narrow layout (column)
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        methodDropdown,
+                        const SizedBox(height: 8),
+                        if (_selectedMethod == 'tools/call') ...[
+                          toolNameField,
+                          const SizedBox(height: 8),
+                        ],
+                        paramsField,
+                        const SizedBox(height: 8),
+                        sendButton,
+                      ],
+                    );
+                  }
+                },
               ),
               const SizedBox(height: 16),
 
@@ -881,8 +927,12 @@ class _MCPClientPageState extends State<MCPClientPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              runAlignment: WrapAlignment.center,
               children: [
                 const Text(
                   'Sessions actives',
@@ -892,6 +942,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
                   ),
                 ),
                 Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     const Text('Filtrer les sandboxes: '),
                     const SizedBox(width: 8),
@@ -1032,54 +1083,77 @@ class _MCPClientPageState extends State<MCPClientPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
+            // Replace Row with Column for better layout on smaller screens
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(
-                  child: DropdownButtonFormField<String>(
-                    value: _selectedScript,
-                    decoration: const InputDecoration(
-                      labelText: 'Script',
-                      border: OutlineInputBorder(),
+                DropdownButtonFormField<String>(
+                  value: _selectedScript,
+                  isExpanded:
+                      true, // Ensure dropdown properly handles long texts
+                  decoration: const InputDecoration(
+                    labelText: 'Script',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: _savedScripts.map((script) {
+                    // Show a truncated version in the dropdown
+                    String displayText = script;
+                    if (displayText.length > 40) {
+                      final lastSeparator = displayText.lastIndexOf('/');
+                      if (lastSeparator != -1 && lastSeparator > 3) {
+                        displayText =
+                            '...${displayText.substring(lastSeparator)}';
+                      } else {
+                        displayText = '${displayText.substring(0, 37)}...';
+                      }
+                    }
+
+                    return DropdownMenuItem(
+                      value: script,
+                      child: Tooltip(
+                        message: script, // Show full path on hover
+                        child: Text(
+                          displayText,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                  onChanged: (value) {
+                    setState(() {
+                      _selectedScript = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<String>(
+                  value: _selectedEnvironment,
+                  isExpanded:
+                      true, // Ensure dropdown properly handles long texts
+                  decoration: const InputDecoration(
+                    labelText: 'Environnement',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: null,
+                      child: Text('Aucun environnement'),
                     ),
-                    items: _savedScripts.map((script) {
+                    ..._savedEnvironments.keys.map((name) {
                       return DropdownMenuItem(
-                        value: script,
-                        child: Text(script),
+                        value: name,
+                        child: Text(
+                          name,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       );
                     }).toList(),
-                    onChanged: (value) {
-                      setState(() {
-                        _selectedScript = value;
-                      });
-                    },
-                  ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: DropdownButtonFormField<String>(
-                    value: _selectedEnvironment,
-                    decoration: const InputDecoration(
-                      labelText: 'Environnement',
-                      border: OutlineInputBorder(),
-                    ),
-                    items: [
-                      const DropdownMenuItem(
-                        value: null,
-                        child: Text('Aucun environnement'),
-                      ),
-                      ..._savedEnvironments.keys.map((name) {
-                        return DropdownMenuItem(
-                          value: name,
-                          child: Text(name),
-                        );
-                      }).toList(),
-                    ],
-                    onChanged: (value) {
-                      setState(() {
-                        _selectedEnvironment = value;
-                      });
-                    },
-                  ),
+                  ],
+                  onChanged: (value) {
+                    setState(() {
+                      _selectedEnvironment = value;
+                    });
+                  },
                 ),
               ],
             ),
@@ -1096,6 +1170,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
                                     _savedEnvironments[_selectedEnvironment]!)
                                 : <String, String>{};
                         connection.startSandbox(_selectedScript!, env);
+                        setState(() {});
                       }
                     }
                   : null,
@@ -1181,7 +1256,7 @@ class _MCPClientPageState extends State<MCPClientPage> {
     return '${bridge['platform']} (${bridge['bridgeId']})';
   }
 
-  // Modify the sandbox display to show bridge assignments
+  // Modify the sandbox display to show bridge assignments and prevent overflow
   Widget _buildSandboxCard(Sandbox sandbox) {
     final sandboxId = sandbox.id;
     final isRunning = sandbox.isRunning;
@@ -1201,6 +1276,8 @@ class _MCPClientPageState extends State<MCPClientPage> {
                   child: Text(
                     'Sandbox: $sandboxId',
                     style: const TextStyle(fontWeight: FontWeight.bold),
+                    overflow:
+                        TextOverflow.ellipsis, // Prevent overflow with ellipsis
                   ),
                 ),
                 Container(
@@ -1224,13 +1301,27 @@ class _MCPClientPageState extends State<MCPClientPage> {
               ],
             ),
             const SizedBox(height: 8),
-            Text('Script: $scriptPath'),
+            Tooltip(
+              message: scriptPath, // Show full path on hover
+              child: Text(
+                'Script: ${_truncatePath(scriptPath)}',
+                overflow:
+                    TextOverflow.ellipsis, // Prevent overflow with ellipsis
+              ),
+            ),
             const SizedBox(height: 4),
             Row(
               children: [
                 const Icon(Icons.link, size: 16),
                 const SizedBox(width: 4),
-                Text('Bridge: $bridgeInfo'),
+                Expanded(
+                  // Add Expanded to prevent overflow
+                  child: Text(
+                    'Bridge: $bridgeInfo',
+                    overflow:
+                        TextOverflow.ellipsis, // Prevent overflow with ellipsis
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 8),
@@ -1263,6 +1354,21 @@ class _MCPClientPageState extends State<MCPClientPage> {
         ),
       ),
     );
+  }
+
+  // Helper method to truncate long paths
+  String _truncatePath(String path) {
+    if (path.length <= 40) return path;
+
+    // Find the last path separator
+    final lastSeparator = path.lastIndexOf('/');
+    if (lastSeparator != -1 && lastSeparator > 3) {
+      // Return ".../<last_part_of_path>"
+      return '...${path.substring(lastSeparator)}';
+    }
+
+    // If no separator found or it's too close to the start, simply truncate
+    return '${path.substring(0, 37)}...';
   }
 }
 

@@ -163,7 +163,9 @@ class Sandbox {
 
     // Exécute un script Node.js
     async runNodeScript(scriptPath) {
+        console.error('[SANDBOX] Running Node.js script:', scriptPath);
         try {
+            console.error('[SANDBOX] Waiting for bridge initialization...');
             await this.bridgeInitializationPromise; // Wait for bridge to be initialized
             console.error('[SANDBOX] Bridge initialization complete, proceeding with runNodeScript.');
         } catch (error) {
