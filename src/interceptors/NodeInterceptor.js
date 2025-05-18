@@ -137,6 +137,18 @@ class NodeInterceptor {
     }
 
     /**
+     * Update bridge status in the interceptor
+     * This is called when bridge initialization status changes to ensure
+     * the interceptor is aware of the current bridge state
+     */
+    updateBridgeStatus() {
+        // Make the interceptor aware of the current bridge status
+        if (this.options.debug) {
+            console.error(`[NodeInterceptor] Updating bridge status: ${this.bridge ? this.bridge.constructor.name : 'null'}, connected: ${this.bridge && this.bridge.isConnected ? this.bridge.isConnected() : false}`);
+        }
+    }
+
+    /**
      * Handle intercepted calls by forwarding them to the bridge
      * @param {string} type - The type of intercepted call
      * @param {Object} payload - The call payload

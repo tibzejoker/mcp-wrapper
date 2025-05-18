@@ -622,35 +622,7 @@ wss.on('connection', (ws) => {
 
                         console.log(`\n✅ Script démarré pour la session ${sessionId}`);
 
-                        // Instruct the sandbox child process to initialize its real bridge client
-                        if (processController && processController.process && typeof processController.process.send === 'function') {
-                            const targetFlutterBridgeId = message.config.targetFlutterBridgeId;
-                            if (!targetFlutterBridgeId) {
-                                console.error(`[MAIN] Error starting sandbox for session ${sessionId}: 'targetFlutterBridgeId' missing in start message config.`);
-                                ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: "'targetFlutterBridgeId' is required in start config." }));
-                                // Consider stopping the sandbox here
-                                return;
-                            }
-
-                            if (connectedBridges.has(targetFlutterBridgeId)) {
-                                console.log(`[MAIN] Instructing sandbox child process (PID: ${processController.process.pid}) to initialize its Bridge client. Target Flutter Bridge ID: ${targetFlutterBridgeId}, Sandbox Session (Client) ID: ${sessionId}, Actual Sandbox ID: ${message.sandboxId}`);
-                                processController.process.send({
-                                    type: 'bridge_register',                // Tells sandbox.js to init its Bridge instance
-                                    targetFlutterBridgeId: targetFlutterBridgeId, // The ID of the Flutter Bridge Portal to use (renamed from bridgeId for clarity)
-                                    sandboxSessionId: sessionId,             // The mcp_client session ID (main.js context)
-                                    actualSandboxId: message.sandboxId     // The unique ID for this sandbox instance, from mcp_client
-                                });
-                            } else {
-                                console.error(`[MAIN] Cannot instruct sandbox for session ${sessionId} to register bridge: Target Flutter Bridge '${targetFlutterBridgeId}' is not connected.`);
-                                ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: `Target Flutter Bridge '${targetFlutterBridgeId}' not connected.` }));
-                                // Optionally, stop the sandbox, as it won't have a functional bridge.
-                                // sandboxInfo.process.stop(); or similar cleanup
-                            }
-                        } else {
-                            console.error(`[MAIN] Sandbox process for session ${sessionId} not available or no send method, cannot send bridge_register instruction.`);
-                            ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: "Sandbox process communication channel not available." }));
-                        }
-
+                        // Envoyer une mise à jour aux clients pour confirmer que la sandbox est démarrée
                         ws.send(JSON.stringify({
                             type: 'sandbox_updated',
                             connectionId: sessionId,
@@ -662,6 +634,43 @@ wss.on('connection', (ws) => {
                             }
                         }));
                         broadcastConnections();
+
+                        // Instruct the sandbox child process to initialize its real bridge client
+                        if (processController && processController.process && typeof processController.process.send === 'function') {
+                            // Get the targetFlutterBridgeId from the message or use the first available bridge
+                            const targetFlutterBridgeId = message.config.targetFlutterBridgeId || getFirstAvailableBridgeId();
+                            
+                            if (!targetFlutterBridgeId) {
+                                console.warn(`[MAIN] Warning: No targetFlutterBridgeId specified in start message config and no bridges available.`);
+                                console.warn(`[MAIN] The sandbox will start with a NullBridge, which will block all operations until a bridge is connected.`);
+                                // Don't block execution, just warn
+                            }
+                            
+                            // If a targetFlutterBridgeId is available (specified or auto-assigned), assign the sandbox to it
+                            if (targetFlutterBridgeId) {
+                                assignBridgeToSandbox(message.sandboxId, targetFlutterBridgeId);
+                                
+                                // If the bridge is connected, send the bridge_register message
+                                if (connectedBridges.has(targetFlutterBridgeId)) {
+                                    console.log(`[MAIN] Instructing sandbox child process (PID: ${processController.process.pid}) to initialize its Bridge client. Target Flutter Bridge ID: ${targetFlutterBridgeId}, Sandbox Session (Client) ID: ${sessionId}, Actual Sandbox ID: ${message.sandboxId}`);
+                                    processController.process.send({
+                                        type: 'bridge_register',                // Tells sandbox.js to init its Bridge instance
+                                        bridgeId: targetFlutterBridgeId,        // The ID of the Flutter Bridge Portal to use
+                                        sandboxSessionId: sessionId,            // The mcp_client session ID (main.js context)
+                                        actualSandboxId: message.sandboxId      // The unique ID for this sandbox instance, from mcp_client
+                                    });
+                                } else {
+                                    console.warn(`[MAIN] Target Flutter Bridge '${targetFlutterBridgeId}' is not currently connected.`);
+                                    console.warn(`[MAIN] The sandbox will start with a NullBridge. Once the bridge connects, try restarting the sandbox.`);
+                                }
+                            } else {
+                                // If no bridge ID is available, just proceed with a NullBridge
+                                console.log(`[MAIN] Starting sandbox without a bridge. Operations will be blocked until a bridge is connected.`);
+                            }
+                        } else {
+                            console.error(`[MAIN] Sandbox process for session ${sessionId} not available or no send method, cannot send bridge_register instruction.`);
+                            ws.send(JSON.stringify({ type: 'error', connectionId: sessionId, sandboxId: message.sandboxId, error: "Sandbox process communication channel not available." }));
+                        }
                     }).catch(error => {
                         console.error(`\n❌ Erreur lors du démarrage du script:`, error);
                         ws.send(JSON.stringify({
@@ -730,6 +739,7 @@ wss.on('connection', (ws) => {
 
                     console.log(`[DEBUG] Sandboxes disponibles:`, Array.from(commandSession.sandboxes.keys()));
                     console.log(`[DEBUG] Recherche sandbox: ${message.sandboxId}`);
+                    console.log(`[DEBUG] Assignations bridge actuelles:`, Array.from(sandboxBridgeAssignments.entries()));
 
                     if (!message.sandboxId) {
                         ws.send(JSON.stringify({
@@ -741,20 +751,54 @@ wss.on('connection', (ws) => {
                         break;
                     }
 
+                    // Vérifier si la sandbox est dans les assignations bridge mais pas dans les sandboxes de la session
+                    const isBridgeAssigned = sandboxBridgeAssignments.has(message.sandboxId);
+                    const assignedBridgeId = sandboxBridgeAssignments.get(message.sandboxId);
+                    
                     if (!commandSession.sandboxes.has(message.sandboxId)) {
                         console.log(`\n[DEBUG] Sandbox ${message.sandboxId} non trouvée. Sandboxes disponibles:`,
                             Array.from(commandSession.sandboxes.keys()));
+                        console.log(`[DEBUG] La sandbox a-t-elle une assignation bridge? ${isBridgeAssigned ? 'Oui, vers ' + assignedBridgeId : 'Non'}`);
 
-                        ws.send(JSON.stringify({
-                            type: 'error',
-                            error: `Sandbox ${message.sandboxId} non trouvée`,
-                            connectionId: sessionId,
-                            details: {
-                                requestedSandbox: message.sandboxId,
-                                availableSandboxes: Array.from(commandSession.sandboxes.keys()),
-                                suggestion: 'Veuillez vérifier que vous utilisez le bon ID de sandbox ou redémarrer la sandbox si nécessaire'
+                        // Si la sandbox est assignée à un bridge mais n'est pas dans la session, c'est peut-être qu'elle n'a pas terminé son initialisation
+                        if (isBridgeAssigned) {
+                            console.log(`[DEBUG] La sandbox ${message.sandboxId} est assignée au bridge ${assignedBridgeId} mais n'est pas initialisée dans la session.`);
+                            console.log(`[DEBUG] Cela peut se produire si le script est un serveur qui continue de s'exécuter mais n'est pas encore prêt à recevoir des commandes.`);
+                            
+                            // Essayer de récupérer les informations sur cette sandbox si elle existe réellement
+                            if (process.pid) {
+                                console.log(`[DEBUG] Essai de récupération d'informations sur la sandbox ${message.sandboxId}...`);
+                                
+                                // Envoyer une notification pour informer l'utilisateur
+                                ws.send(JSON.stringify({
+                                    type: 'error',
+                                    error: `Sandbox ${message.sandboxId} trouvée dans les assignations mais pas encore prête à recevoir des commandes`,
+                                    connectionId: sessionId,
+                                    details: {
+                                        requestedSandbox: message.sandboxId,
+                                        hasBridgeAssignment: isBridgeAssigned,
+                                        assignedBridgeId: assignedBridgeId,
+                                        suggestion: 'Le script est probablement un serveur web ou une application qui ne prend pas en charge stdin. Essayez d\'accéder directement au serveur.'
+                                    }
+                                }));
+                                
+                                // On pourrait ici ajouter une logique pour "adopter" automatiquement cette sandbox dans le session.sandboxes
+                                // si elle est effectivement en cours d'exécution mais n'a pas été ajoutée à la session
                             }
-                        }));
+                        } else {
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                error: `Sandbox ${message.sandboxId} non trouvée`,
+                                connectionId: sessionId,
+                                details: {
+                                    requestedSandbox: message.sandboxId,
+                                    availableSandboxes: Array.from(commandSession.sandboxes.keys()),
+                                    hasBridgeAssignment: isBridgeAssigned,
+                                    assignedBridgeId: assignedBridgeId,
+                                    suggestion: 'Veuillez vérifier que vous utilisez le bon ID de sandbox ou redémarrer la sandbox si nécessaire'
+                                }
+                            }));
+                        }
                         break;
                     }
 
@@ -795,15 +839,55 @@ wss.on('connection', (ws) => {
 
                         debugLog('\n[DEBUG] Envoi de la commande JSON-RPC:', JSON.stringify(jsonRpcRequest, null, 2));
 
-                        // Send the parsed JSON-RPC request directly
-                        sandboxInfo.process.stdin.write(JSON.stringify(jsonRpcRequest) + '\n');
+                        // Si le processus a stdin, on envoie la commande normalement
+                        if (sandboxInfo.process && sandboxInfo.process.stdin && sandboxInfo.process.stdin.writable) {
+                            // Send the parsed JSON-RPC request directly
+                            sandboxInfo.process.stdin.write(JSON.stringify(jsonRpcRequest) + '\n');
 
-                        ws.send(JSON.stringify({
-                            type: 'command_sent',
-                            connectionId: sessionId,
-                            sandboxId: message.sandboxId,
-                            command: jsonRpcRequest
-                        }));
+                            ws.send(JSON.stringify({
+                                type: 'command_sent',
+                                connectionId: sessionId,
+                                sandboxId: message.sandboxId,
+                                command: jsonRpcRequest
+                            }));
+                        } else {
+                            // Si c'est un script web qui n'a pas de stdin disponible, tenter d'autres méthodes
+                            console.log(`\n[DEBUG] Le processus n'a pas de stdin disponible. Il s'agit probablement d'un serveur web ou d'un script qui n'utilise pas stdin.`);
+                            
+                            // Vérifier si la sandbox est connectée à un bridge
+                            const assignedBridgeId = sandboxBridgeAssignments.get(message.sandboxId);
+                            if (assignedBridgeId && connectedBridges.has(assignedBridgeId)) {
+                                console.log(`\n[DEBUG] La sandbox est assignée au bridge ${assignedBridgeId}. Tentative d'utiliser ce canal à la place.`);
+                                
+                                // Pour l'instant, envoyer un message d'erreur plus informatif
+                                ws.send(JSON.stringify({
+                                    type: 'error',
+                                    error: 'Le script est en cours d\'exécution mais ne peut pas recevoir de commandes via stdin',
+                                    connectionId: sessionId,
+                                    sandboxId: message.sandboxId,
+                                    details: {
+                                        reason: 'stdin_unavailable',
+                                        scriptType: 'possible_web_server',
+                                        assignedBridgeId: assignedBridgeId,
+                                        suggestion: 'Les serveurs web et scripts sans interruption ne peuvent pas recevoir de commandes via stdin. Essayez de communiquer directement avec le serveur, ou utilisez un autre mécanisme.'
+                                    }
+                                }));
+                            } else {
+                                // Pas de bridge assigné ou bridge non connecté
+                                ws.send(JSON.stringify({
+                                    type: 'error',
+                                    error: 'Le processus n\'a pas de stdin disponible et n\'est pas connecté à un bridge.',
+                                    connectionId: sessionId,
+                                    sandboxId: message.sandboxId,
+                                    details: {
+                                        reason: 'stdin_and_bridge_unavailable',
+                                        hasBridgeAssignment: !!assignedBridgeId,
+                                        assignedBridgeId: assignedBridgeId,
+                                        suggestion: 'Redémarrez la sandbox et assurez-vous qu\'elle se connecte correctement au bridge.'
+                                    }
+                                }));
+                            }
+                        }
                     } catch (error) {
                         console.error('\n❌ [ERROR] Command parsing failed:', error.message);
                         ws.send(JSON.stringify({

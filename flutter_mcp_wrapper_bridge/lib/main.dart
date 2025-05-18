@@ -16,6 +16,23 @@ class MCPBridgePortal extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MCP Bridge Portal',
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData.dark(useMaterial3: true).copyWith(
+        colorScheme: const ColorScheme.dark(
+          primary: Colors.blueGrey,
+          secondary: Colors.teal,
+          surface: Color(0xFF1E1E1E),
+          background: Color(0xFF121212),
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF1E1E1E),
+          foregroundColor: Colors.white,
+        ),
+        cardTheme: const CardTheme(
+          color: Color(0xFF242424),
+        ),
+        scaffoldBackgroundColor: const Color(0xFF121212),
+      ),
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
