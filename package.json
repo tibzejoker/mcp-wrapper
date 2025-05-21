@@ -1,14 +1,19 @@
 {
-  "name": "node-directory-display",
+  "name": "mcp-wrapper",
   "version": "1.0.0",
-  "description": "A simple Node.js script that displays its current directory",
+  "description": "A proxy wrapper for MCP servers",
   "main": "main.js",
   "type": "module",
   "scripts": {
     "start": "node main.js",
-    "dev": "nodemon main.js"
+    "dev": "nodemon main.js",
+    "build": "mkdir -p dist && cp main.js dist/index.js",
+    "watch": "nodemon --watch main.js --exec 'npm run build'",
+    "tail-log": "node tail-log.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.4",
+    "dotenv": "^16.4.5",
     "ws": "^8.18.2"
   },
   "devDependencies": {
