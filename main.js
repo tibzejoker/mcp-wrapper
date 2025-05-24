@@ -91,11 +91,38 @@ if (!realMcpServerPath) {
 async function main() {
   try {
     log(`[MCP Proxy] Starting proxy for MCP server at: ${realMcpServerPath}`);
-    
+
+    // --- Interceptor Injection ---
+    let interceptorPath = '';
+    try {
+      // Resolve path to interceptor-node.js, which is in the same directory as main.js
+      const currentScriptPath = new URL(import.meta.url).pathname;
+      const currentDir = path.dirname(currentScriptPath.substring(process.platform === "win32" ? 1 : 0)); // Handle potential leading '/' on Windows
+      interceptorPath = path.resolve(currentDir, 'interceptor-node.js');
+      log(`[MCP Proxy] Resolved interceptor path: ${interceptorPath}`);
+    } catch (e) {
+      log(`[MCP Proxy] Error resolving interceptor path: ${e.message}. Interception will likely fail.`);
+    }
+
+    const newArgs = [];
+    if (interceptorPath && fs.existsSync(interceptorPath)) {
+      log(`[MCP Proxy] Interceptor script found at ${interceptorPath}. Injecting.`);
+      newArgs.push('--require', interceptorPath);
+    } else {
+      log(`[MCP Proxy] CRITICAL WARNING: Interceptor script not found at ${interceptorPath || 'resolved path'}. Interception will NOT be active.`);
+      // Depending on policy, could exit here: process.exit(1);
+    }
+    newArgs.push(realMcpServerPath);
+    // If realMcpServerPath was supposed to have its own arguments, they would need to be
+    // parsed from process.argv and added here. Currently, it's treated as a single path.
+    // For example, if process.argv was [node, main.js, realLaunchCmd, realServerPath, ...serverArgs],
+    // then serverArgs (process.argv.slice(4)) should be added to newArgs.
+    // The current problem description implies realMcpServerPath is the only argument to the server itself.
+
     // Initialize the real MCP server client
     const realServerTransport = new StdioClientTransport({
-      command: realLaunchCommand,
-      args: [realMcpServerPath],
+      command: realLaunchCommand, // Assumed to be 'node' or a command that passes args to node
+      args: newArgs,
       // Pass environment variables from the current process
       env: process.env,
     });
@@ -109,6 +136,37 @@ async function main() {
     log('[MCP Proxy] Connecting to real server...');
     await realServerClient.connect(realServerTransport);
     log('[MCP Proxy] Successfully connected to real server');
+
+    // --- Capture and log stderr from the real MCP server (child process) ---
+    if (realServerTransport.process && realServerTransport.process.stderr) {
+      log('[MCP Proxy] Attaching stderr listener to the real MCP server process.');
+      realServerTransport.process.stderr.on('data', (data) => {
+        const messages = data.toString().split('\n').filter(line => line.trim().length > 0);
+        messages.forEach(message => {
+          // The log() function will add its own timestamp and handle file logging.
+          // The [INTERCEPTOR:] prefix from interceptor-node.js will be part of the message.
+          log(message); 
+        });
+      });
+      realServerTransport.process.stderr.on('error', (err) => {
+        log(`[MCP Proxy] Error on real MCP server stderr stream: ${err.message}`);
+      });
+       // Also capture stdout for completeness, in case the interceptor or server logs there unexpectedly
+      if (realServerTransport.process.stdout) {
+        realServerTransport.process.stdout.on('data', (data) => {
+            const messages = data.toString().split('\n').filter(line => line.trim().length > 0);
+            messages.forEach(message => {
+              log(`[CHILD_STDOUT] ${message}`);
+            });
+        });
+        realServerTransport.process.stdout.on('error', (err) => {
+            log(`[MCP Proxy] Error on real MCP server stdout stream: ${err.message}`);
+        });
+      }
+      log('[MCP Proxy] Interceptor logs (from the wrapped server) will be prefixed with [INTERCEPTOR:] and other child process outputs will be prefixed with [CHILD_STDOUT] or will appear directly if they are from the interceptor.');
+    } else {
+      log('[MCP Proxy] Warning: Could not attach stderr/stdout listener to the real MCP server process. Interceptor or server logs might not be fully captured in the main log file.');
+    }
     
     // Initialize our proxy server
     const proxyServer = new Server(
